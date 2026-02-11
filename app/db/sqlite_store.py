@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,16 @@ class DocumentRecord:
     modified_time: float
     indexed_at: str
     num_chunks: int
+
+
+@dataclass(frozen=True)
+class ChunkRecord:
+    id: str
+    doc_id: str
+    chunk_id: int
+    text: str
+    source_path: str
+    source_name: str
 
 
 class SQLiteDocumentStore:
@@ -49,6 +60,19 @@ class SQLiteDocumentStore:
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(file_path)"
+            )
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(
+                    id UNINDEXED,
+                    doc_id UNINDEXED,
+                    chunk_id UNINDEXED,
+                    source_path UNINDEXED,
+                    source_name UNINDEXED,
+                    text,
+                    tokenize = 'unicode61'
+                )
+                """
             )
 
     def get_by_hash(self, file_hash: str) -> DocumentRecord | None:
@@ -131,6 +155,80 @@ class SQLiteDocumentStore:
                     for record in records
                 ],
             )
+
+    def delete_chunks_by_doc_id(self, doc_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM chunk_fts WHERE doc_id = ?", (doc_id,))
+
+    def replace_chunks(self, doc_id: str, chunks: Iterable[ChunkRecord]) -> None:
+        chunk_records = list(chunks)
+        with self._connect() as conn:
+            conn.execute("DELETE FROM chunk_fts WHERE doc_id = ?", (doc_id,))
+            if chunk_records:
+                conn.executemany(
+                    """
+                    INSERT INTO chunk_fts (
+                        id, doc_id, chunk_id, source_path, source_name, text
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            chunk.id,
+                            chunk.doc_id,
+                            chunk.chunk_id,
+                            chunk.source_path,
+                            chunk.source_name,
+                            chunk.text,
+                        )
+                        for chunk in chunk_records
+                    ],
+                )
+
+    @staticmethod
+    def _to_fts_query(raw_query: str) -> str:
+        tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9\.\-_]*", raw_query.lower())
+        if not tokens:
+            return ""
+        unique_tokens = list(dict.fromkeys(tokens))
+        return " OR ".join(f'"{token}"' for token in unique_tokens[:20])
+
+    def search_chunks(self, query: str, *, top_k: int = 5) -> list[dict]:
+        fts_query = self._to_fts_query(query)
+        if not fts_query:
+            return []
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    id,
+                    doc_id,
+                    chunk_id,
+                    text,
+                    source_path,
+                    source_name,
+                    bm25(chunk_fts) AS bm25_score
+                FROM chunk_fts
+                WHERE chunk_fts MATCH ?
+                ORDER BY bm25_score ASC
+                LIMIT ?
+                """,
+                (fts_query, max(1, top_k)),
+            ).fetchall()
+
+        return [
+            {
+                "id": row[0],
+                "doc_id": row[1],
+                "chunk_id": row[2],
+                "text": row[3],
+                "source_path": row[4],
+                "source_name": row[5],
+                "_lexical_score": row[6],
+            }
+            for row in rows
+        ]
 
     @staticmethod
     def now_iso() -> str:

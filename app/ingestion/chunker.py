@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 import tiktoken
 
 
@@ -9,6 +10,8 @@ import tiktoken
 class TokenChunker:
     chunk_size: int = 500
     overlap: int = 50
+    separators: tuple[str, ...] = ("\n\n", "\n", ". ", " ", "")
+    length_kind: str = "token"
     encoding_name: str = "cl100k_base"
 
     def chunk(self, text: str) -> list[str]:
@@ -17,16 +20,19 @@ class TokenChunker:
         if self.overlap >= self.chunk_size:
             raise ValueError("Overlap must be smaller than chunk size.")
 
-        encoding = tiktoken.get_encoding(self.encoding_name)
-        tokens = encoding.encode(text)
-        chunks: list[str] = []
-
-        start = 0
-        while start < len(tokens):
-            end = min(start + self.chunk_size, len(tokens))
-            chunk_tokens = tokens[start:end]
-            chunks.append(encoding.decode(chunk_tokens))
-            if end == len(tokens):
-                break
-            start = max(end - self.overlap, 0)
-        return chunks
+        # Default to token-aware splitting for consistent embedding payload sizes.
+        if self.length_kind == "token":
+            encoding = tiktoken.get_encoding(self.encoding_name)
+            splitter = RecursiveCharacterTextSplitter(
+                length_function=lambda chunk_text: len(encoding.encode(chunk_text)),
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.overlap,
+                separators=list(self.separators),
+            )
+        else:
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.overlap,
+                separators=list(self.separators),
+            )
+        return [chunk for chunk in splitter.split_text(text) if chunk.strip()]

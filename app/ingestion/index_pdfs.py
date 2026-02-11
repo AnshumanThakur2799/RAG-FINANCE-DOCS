@@ -2,15 +2,25 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import logging
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterator
 
 from app.config import Settings
-from app.db.sqlite_store import DocumentRecord, SQLiteDocumentStore
+from app.db.sqlite_store import ChunkRecord, DocumentRecord, SQLiteDocumentStore
 from app.db.vector_store import LanceDBVectorStore
 from app.embeddings.client import build_embedding_client
 from app.ingestion.chunker import TokenChunker
 from app.ingestion.pdf_reader import extract_text_from_pdf
+
+
+@dataclass(frozen=True)
+class IndexResult:
+    indexed: bool
+    num_chunks: int
+    status: str
 
 
 def iter_pdf_paths(input_dir: Path) -> Iterator[Path]:
@@ -43,16 +53,16 @@ def index_pdf(
     store: SQLiteDocumentStore,
     reindex: bool,
     embed_batch_size: int,
-) -> bool:
+    recreate_table_on_dim_mismatch: bool,
+) -> IndexResult:
     file_hash = compute_file_hash(path)
     existing = store.get_by_hash(file_hash)
     if existing and not reindex:
-        return False
+        return IndexResult(indexed=False, num_chunks=0, status="already_indexed")
 
     text = extract_text_from_pdf(path)
     if not text:
-        print(f"Skipping empty PDF: {path}")
-        return False
+        return IndexResult(indexed=False, num_chunks=0, status="empty_pdf")
 
     chunks = chunker.chunk(text)
     embeddings: list[list[float]] = []
@@ -67,10 +77,12 @@ def index_pdf(
         vector_store.delete_by_doc_id(doc_id)
 
     records = []
+    lexical_records: list[ChunkRecord] = []
     for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+        chunk_uid = f"{doc_id}::chunk_{idx}"
         records.append(
             {
-                "id": f"{doc_id}::chunk_{idx}",
+                "id": chunk_uid,
                 "doc_id": doc_id,
                 "chunk_id": idx,
                 "text": chunk,
@@ -79,8 +91,21 @@ def index_pdf(
                 "source_name": path.name,
             }
         )
+        lexical_records.append(
+            ChunkRecord(
+                id=chunk_uid,
+                doc_id=doc_id,
+                chunk_id=idx,
+                text=chunk,
+                source_path=str(path.resolve()),
+                source_name=path.name,
+            )
+        )
 
-    vector_store.upsert_chunks(records)
+    vector_store.upsert_chunks(
+        records, recreate_on_dim_mismatch=recreate_table_on_dim_mismatch
+    )
+    store.replace_chunks(doc_id, lexical_records)
 
     stat = path.stat()
     store.upsert_document(
@@ -95,7 +120,7 @@ def index_pdf(
             num_chunks=len(chunks),
         )
     )
-    return True
+    return IndexResult(indexed=True, num_chunks=len(chunks), status="indexed")
 
 
 def main() -> None:
@@ -123,7 +148,25 @@ def main() -> None:
         default=64,
         help="Number of chunks per embedding request.",
     )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging verbosity.",
+    )
+    parser.add_argument(
+        "--no-table-recreate-on-dim-mismatch",
+        action="store_true",
+        help=(
+            "Do not recreate LanceDB table when embedding dimension mismatches "
+            "(advanced/debug use)."
+        ),
+    )
     args = parser.parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper()),
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
 
     settings = Settings.from_env()
     input_dir = Path(args.input)
@@ -147,11 +190,28 @@ def main() -> None:
         overlap=settings.chunk_overlap_tokens,
     )
 
+    all_pdfs = list(iter_pdf_paths(input_dir))
+    run_start = time.perf_counter()
+    wall_start = store.now_iso()
+
     indexed_count = 0
     skipped_count = 0
-    for pdf_path in iter_pdf_paths(input_dir):
+    failed_count = 0
+    total_chunks_indexed = 0
+    total_file_processing_seconds = 0.0
+
+    logging.info(
+        "Starting indexing run | input=%s | total_files=%s | reindex=%s | embed_batch_size=%s",
+        str(input_dir.resolve()),
+        len(all_pdfs),
+        args.reindex,
+        args.embed_batch_size,
+    )
+
+    for file_number, pdf_path in enumerate(all_pdfs, start=1):
+        file_start = time.perf_counter()
         try:
-            indexed = index_pdf(
+            result = index_pdf(
                 pdf_path,
                 chunker=chunker,
                 embed_client=embed_client,
@@ -159,17 +219,68 @@ def main() -> None:
                 store=store,
                 reindex=args.reindex,
                 embed_batch_size=args.embed_batch_size,
+                recreate_table_on_dim_mismatch=(
+                    args.reindex and not args.no_table_recreate_on_dim_mismatch
+                ),
             )
-            if indexed:
+            file_elapsed = time.perf_counter() - file_start
+            total_file_processing_seconds += file_elapsed
+
+            if result.indexed:
                 indexed_count += 1
-                print(f"Indexed: {pdf_path.name}")
+                total_chunks_indexed += result.num_chunks
+                logging.info(
+                    "[%s/%s] Indexed %s | chunks=%s | time=%.2fs",
+                    file_number,
+                    len(all_pdfs),
+                    pdf_path.name,
+                    result.num_chunks,
+                    file_elapsed,
+                )
             else:
                 skipped_count += 1
-                print(f"Skipped: {pdf_path.name}")
+                logging.info(
+                    "[%s/%s] Skipped %s | reason=%s | time=%.2fs",
+                    file_number,
+                    len(all_pdfs),
+                    pdf_path.name,
+                    result.status,
+                    file_elapsed,
+                )
         except Exception as exc:
-            print(f"Failed: {pdf_path.name} -> {exc}")
+            file_elapsed = time.perf_counter() - file_start
+            total_file_processing_seconds += file_elapsed
+            failed_count += 1
+            logging.exception(
+                "[%s/%s] Failed %s | time=%.2fs | error=%s",
+                file_number,
+                len(all_pdfs),
+                pdf_path.name,
+                file_elapsed,
+                str(exc),
+            )
 
-    print(f"Done. Indexed: {indexed_count}, Skipped: {skipped_count}")
+    run_elapsed = time.perf_counter() - run_start
+    avg_file_seconds = (
+        total_file_processing_seconds / len(all_pdfs) if all_pdfs else 0.0
+    )
+    avg_chunks_per_indexed = (
+        total_chunks_indexed / indexed_count if indexed_count else 0.0
+    )
+
+    logging.info(
+        "Indexing complete | started_at=%s | finished_at=%s | total_files=%s | indexed=%s | skipped=%s | failed=%s | total_chunks_indexed=%s | avg_chunks_per_indexed=%.2f | processing_time_seconds=%.2f | avg_time_per_file_seconds=%.2f",
+        wall_start,
+        store.now_iso(),
+        len(all_pdfs),
+        indexed_count,
+        skipped_count,
+        failed_count,
+        total_chunks_indexed,
+        avg_chunks_per_indexed,
+        run_elapsed,
+        avg_file_seconds,
+    )
 
 
 if __name__ == "__main__":

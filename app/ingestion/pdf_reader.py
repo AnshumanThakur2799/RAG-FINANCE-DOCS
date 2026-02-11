@@ -2,18 +2,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import fitz
+from markitdown import MarkItDown
 
 
 def extract_text_from_pdf(path: Path) -> str:
     if not path.exists():
         raise FileNotFoundError(f"PDF not found: {path}")
+    if path.suffix.lower() != ".pdf":
+        raise ValueError(f"Expected a PDF file, got: {path}")
 
-    text_chunks: list[str] = []
-    with fitz.open(path) as doc:
-        for page in doc:
-            page_text = page.get_text("text") or ""
-            if page_text:
-                text_chunks.append(page_text.strip())
-
-    return "\n".join(text_chunks).strip()
+    converter = MarkItDown()
+    result = converter.convert(str(path))
+    markdown_text = (result.text_content or "").strip()
+    return markdown_text

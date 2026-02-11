@@ -1,6 +1,7 @@
 openai
 lancedb
-pymupdf
 tiktoken
 python-dotenv
 sentence-transformers
+markitdown[pdf]
+langchain-text-splitters

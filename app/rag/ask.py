@@ -4,9 +4,11 @@ import argparse
 import time
 
 from app.config import Settings
+from app.db.sqlite_store import SQLiteDocumentStore
 from app.db.vector_store import LanceDBVectorStore
 from app.embeddings.client import build_embedding_client
 from app.llm.client import build_llm_client
+from app.retrieval import RETRIEVAL_MODES, build_retriever
 
 
 SYSTEM_PROMPT = (
@@ -31,6 +33,11 @@ def main() -> None:
     parser.add_argument("--query", required=True, help="Question to ask.")
     parser.add_argument("--top-k", type=int, default=5, help="Number of chunks.")
     parser.add_argument("--table", default="document_chunks", help="LanceDB table name.")
+    parser.add_argument(
+        "--retrieval-mode",
+        default="",
+        help=f"Retrieval mode: {', '.join(RETRIEVAL_MODES)}.",
+    )
     args = parser.parse_args()
 
     settings = Settings.from_env()
@@ -47,7 +54,17 @@ def main() -> None:
         local_prompt_style=settings.local_embedding_prompt_style,
         local_device=settings.local_embedding_device,
     )
+    document_store = SQLiteDocumentStore(settings.sqlite_db_path)
     vector_store = LanceDBVectorStore(settings.lancedb_dir, table_name=args.table)
+    retrieval_mode = args.retrieval_mode.strip().lower() or settings.retrieval_mode
+    retriever = build_retriever(
+        mode=retrieval_mode,
+        embed_client=embed_client,
+        vector_store=vector_store,
+        document_store=document_store,
+        hybrid_rrf_k=settings.hybrid_rrf_k,
+        hybrid_candidate_multiplier=settings.hybrid_candidate_multiplier,
+    )
     llm_client = build_llm_client(
         settings.llm_provider,
         deepinfra_api_key=settings.deepinfra_api_key,
@@ -57,12 +74,10 @@ def main() -> None:
         temperature=settings.llm_temperature,
     )
 
-    embedding = embed_client.embed([args.query], input_type="query")[0]
-
     search_start = time.perf_counter()
-    results = vector_store.search(embedding, top_k=max(1, args.top_k))
+    results = retriever.retrieve(args.query, top_k=max(1, args.top_k))
     search_elapsed = time.perf_counter() - search_start
-    print(f"Vector search time: {search_elapsed:.4f} seconds")
+    print(f"Retrieval time ({retrieval_mode}): {search_elapsed:.4f} seconds")
 
     if not results:
         print("No results found. Have you indexed PDFs yet?")

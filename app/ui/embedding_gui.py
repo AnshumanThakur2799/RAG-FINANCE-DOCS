@@ -4,12 +4,12 @@ import tkinter as tk
 from tkinter import ttk
 import time
 
-import time
-
 from app.config import Settings
+from app.db.sqlite_store import SQLiteDocumentStore
 from app.db.vector_store import LanceDBVectorStore
 from app.embeddings.client import build_embedding_client
 from app.llm.client import build_llm_client
+from app.retrieval import RETRIEVAL_MODES, build_retriever
 
 
 SYSTEM_PROMPT = (
@@ -26,6 +26,7 @@ class EmbeddingApp:
         self.root.geometry("760x640")
 
         settings = Settings.from_env()
+        self.settings = settings
         self.embed_client = build_embedding_client(
             settings.embedding_provider,
             openai_api_key=settings.openai_api_key,
@@ -39,6 +40,7 @@ class EmbeddingApp:
             local_prompt_style=settings.local_embedding_prompt_style,
             local_device=settings.local_embedding_device,
         )
+        self.document_store = SQLiteDocumentStore(settings.sqlite_db_path)
         self.vector_store = LanceDBVectorStore(settings.lancedb_dir)
         self.llm_client = build_llm_client(
             settings.llm_provider,
@@ -84,6 +86,19 @@ class EmbeddingApp:
         topk_entry = ttk.Entry(button_row, textvariable=self.topk_var, width=4)
         topk_entry.pack(side=tk.LEFT)
 
+        mode_label = ttk.Label(button_row, text="Mode:")
+        mode_label.pack(side=tk.LEFT, padx=(16, 4))
+
+        self.mode_var = tk.StringVar(value=self.settings.retrieval_mode)
+        mode_combo = ttk.Combobox(
+            button_row,
+            textvariable=self.mode_var,
+            width=9,
+            values=list(RETRIEVAL_MODES),
+            state="readonly",
+        )
+        mode_combo.pack(side=tk.LEFT)
+
         clear_button = ttk.Button(button_row, text="Clear", command=self.on_clear)
         clear_button.pack(side=tk.LEFT, padx=(8, 0))
 
@@ -123,12 +138,19 @@ class EmbeddingApp:
         except ValueError:
             self._write_output("Top K must be a number.")
             return
+        mode = self.mode_var.get().strip().lower() or self.settings.retrieval_mode
 
         try:
-            embedding = self.embed_client.embed([query], input_type="query")[0]
-            # get the search time 
+            retriever = build_retriever(
+                mode=mode,
+                embed_client=self.embed_client,
+                vector_store=self.vector_store,
+                document_store=self.document_store,
+                hybrid_rrf_k=self.settings.hybrid_rrf_k,
+                hybrid_candidate_multiplier=self.settings.hybrid_candidate_multiplier,
+            )
             start_time = time.time()
-            results = self.vector_store.search(embedding, top_k=top_k)
+            results = retriever.retrieve(query, top_k=top_k)
             end_time = time.time()
             search_time = end_time - start_time
         except Exception as exc:
@@ -143,7 +165,13 @@ class EmbeddingApp:
         for idx, result in enumerate(results, start=1):
             source = result.get("source_name") or result.get("source_path", "unknown")
             chunk_id = result.get("chunk_id", "n/a")
-            score = result.get("_distance", result.get("score", "n/a"))
+            score = result.get(
+                "_rrf_score",
+                result.get(
+                    "_distance",
+                    result.get("_lexical_score", result.get("score", "n/a")),
+                ),
+            )
             if isinstance(score, float):
                 score_display = f"{score:.4f}"
             else:
@@ -155,7 +183,7 @@ class EmbeddingApp:
             lines.append(f"   {text}")
         
         output = (
-            f"Vector search time: {search_time:.4f} seconds\n\n"
+            f"Retrieval time ({mode}): {search_time:.4f} seconds\n\n"
             "\n".join(lines)
         )
         self._write_output(output)
@@ -171,11 +199,19 @@ class EmbeddingApp:
         except ValueError:
             self._write_output("Top K must be a number.")
             return
+        mode = self.mode_var.get().strip().lower() or self.settings.retrieval_mode
 
         try:
-            embedding = self.embed_client.embed([query], input_type="query")[0]
+            retriever = build_retriever(
+                mode=mode,
+                embed_client=self.embed_client,
+                vector_store=self.vector_store,
+                document_store=self.document_store,
+                hybrid_rrf_k=self.settings.hybrid_rrf_k,
+                hybrid_candidate_multiplier=self.settings.hybrid_candidate_multiplier,
+            )
             search_start = time.perf_counter()
-            results = self.vector_store.search(embedding, top_k=top_k)
+            results = retriever.retrieve(query, top_k=top_k)
             search_elapsed = time.perf_counter() - search_start
         except Exception as exc:
             self._write_output(f"Search failed: {exc}")
@@ -208,7 +244,7 @@ class EmbeddingApp:
             return
 
         output = (
-            f"Vector search time: {search_elapsed:.4f} seconds\n\n"
+            f"Retrieval time ({mode}): {search_elapsed:.4f} seconds\n\n"
             f"Answer:\n{answer} \n\n"
             f"LLM call time: {llm_elapsed:.4f} seconds"
         )

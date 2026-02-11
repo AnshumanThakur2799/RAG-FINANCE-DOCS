@@ -39,6 +39,9 @@ class Settings:
     lancedb_dir: Path
     chunk_size_tokens: int
     chunk_overlap_tokens: int
+    retrieval_mode: str
+    hybrid_rrf_k: int
+    hybrid_candidate_multiplier: int
 
     @staticmethod
     def from_env() -> "Settings":
@@ -84,4 +87,9 @@ class Settings:
             lancedb_dir=Path(os.getenv("LANCEDB_DIR", lancedb_default)),
             chunk_size_tokens=int(os.getenv("CHUNK_SIZE_TOKENS", "500")),
             chunk_overlap_tokens=int(os.getenv("CHUNK_OVERLAP_TOKENS", "50")),
+            retrieval_mode=os.getenv("RETRIEVAL_MODE", "hybrid"),
+            hybrid_rrf_k=int(os.getenv("HYBRID_RRF_K", "60")),
+            hybrid_candidate_multiplier=int(
+                os.getenv("HYBRID_CANDIDATE_MULTIPLIER", "4")
+            ),
         )
