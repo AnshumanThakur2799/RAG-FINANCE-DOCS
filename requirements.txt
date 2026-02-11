@@ -1,0 +1,6 @@
+openai
+lancedb
+pymupdf
+tiktoken
+python-dotenv
+sentence-transformers
