@@ -1,5 +1,6 @@
 openai
 lancedb
+qdrant-client
 tiktoken
 python-dotenv
 sentence-transformers

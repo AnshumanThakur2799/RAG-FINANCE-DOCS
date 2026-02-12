@@ -36,7 +36,12 @@ class Settings:
     llm_max_tokens: int
     llm_temperature: float
     sqlite_db_path: Path
+    vector_db_provider: str
     lancedb_dir: Path
+    qdrant_url: str
+    qdrant_api_key: str | None
+    qdrant_timeout_seconds: float
+    qdrant_prefer_grpc: bool
     chunk_size_tokens: int
     chunk_overlap_tokens: int
     retrieval_mode: str
@@ -84,7 +89,14 @@ class Settings:
             llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "512")),
             llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")),
             sqlite_db_path=Path(os.getenv("SQLITE_DB_PATH", sqlite_default)),
+            vector_db_provider=os.getenv("VECTOR_DB_PROVIDER", "lancedb"),
             lancedb_dir=Path(os.getenv("LANCEDB_DIR", lancedb_default)),
+            qdrant_url=os.getenv("QDRANT_URL", "http://localhost:6333"),
+            qdrant_api_key=os.getenv("QDRANT_API_KEY"),
+            qdrant_timeout_seconds=float(os.getenv("QDRANT_TIMEOUT_SECONDS", "30")),
+            qdrant_prefer_grpc=_parse_bool(
+                os.getenv("QDRANT_PREFER_GRPC"), False
+            ),
             chunk_size_tokens=int(os.getenv("CHUNK_SIZE_TOKENS", "500")),
             chunk_overlap_tokens=int(os.getenv("CHUNK_OVERLAP_TOKENS", "50")),
             retrieval_mode=os.getenv("RETRIEVAL_MODE", "hybrid"),

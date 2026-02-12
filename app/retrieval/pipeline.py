@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from app.db.sqlite_store import SQLiteDocumentStore
-from app.db.vector_store import LanceDBVectorStore
+from app.db.vector_store import VectorStore
 
 
 class Retriever(Protocol):
@@ -15,7 +15,7 @@ class Retriever(Protocol):
 @dataclass(frozen=True)
 class DenseVectorRetriever:
     embed_client: Any
-    vector_store: LanceDBVectorStore
+    vector_store: VectorStore
 
     def retrieve(self, query: str, *, top_k: int) -> list[dict[str, Any]]:
         embedding = self.embed_client.embed([query], input_type="query")[0]
@@ -86,7 +86,7 @@ def build_retriever(
     *,
     mode: str,
     embed_client: Any,
-    vector_store: LanceDBVectorStore,
+    vector_store: VectorStore,
     document_store: SQLiteDocumentStore,
     hybrid_rrf_k: int = 60,
     hybrid_candidate_multiplier: int = 4,

@@ -4,16 +4,18 @@ import argparse
 
 from app.config import Settings
 from app.db.sqlite_store import SQLiteDocumentStore
-from app.db.vector_store import LanceDBVectorStore
+from app.db.vector_store import build_vector_store
 from app.embeddings.client import build_embedding_client
 from app.retrieval import RETRIEVAL_MODES, build_retriever
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Search LanceDB for matching chunks.")
+    parser = argparse.ArgumentParser(description="Search vector store for matching chunks.")
     parser.add_argument("--query", required=True, help="Query text.")
     parser.add_argument("--top-k", type=int, default=5, help="Number of results.")
-    parser.add_argument("--table", default="document_chunks", help="LanceDB table name.")
+    parser.add_argument(
+        "--table", default="document_chunks", help="Vector collection/table name."
+    )
     parser.add_argument(
         "--retrieval-mode",
         default="",
@@ -36,7 +38,7 @@ def main() -> None:
         local_device=settings.local_embedding_device,
     )
     document_store = SQLiteDocumentStore(settings.sqlite_db_path)
-    vector_store = LanceDBVectorStore(settings.lancedb_dir, table_name=args.table)
+    vector_store = build_vector_store(settings, table_name=args.table)
     retrieval_mode = args.retrieval_mode.strip().lower() or settings.retrieval_mode
     retriever = build_retriever(
         mode=retrieval_mode,

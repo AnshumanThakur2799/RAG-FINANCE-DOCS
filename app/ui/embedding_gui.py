@@ -6,7 +6,7 @@ import time
 
 from app.config import Settings
 from app.db.sqlite_store import SQLiteDocumentStore
-from app.db.vector_store import LanceDBVectorStore
+from app.db.vector_store import build_vector_store
 from app.embeddings.client import build_embedding_client
 from app.llm.client import build_llm_client
 from app.retrieval import RETRIEVAL_MODES, build_retriever
@@ -41,7 +41,7 @@ class EmbeddingApp:
             local_device=settings.local_embedding_device,
         )
         self.document_store = SQLiteDocumentStore(settings.sqlite_db_path)
-        self.vector_store = LanceDBVectorStore(settings.lancedb_dir)
+        self.vector_store = build_vector_store(settings, table_name="document_chunks")
         self.llm_client = build_llm_client(
             settings.llm_provider,
             deepinfra_api_key=settings.deepinfra_api_key,
@@ -73,7 +73,7 @@ class EmbeddingApp:
         embed_button = ttk.Button(button_row, text="Generate Embedding", command=self.on_embed)
         embed_button.pack(side=tk.LEFT)
 
-        search_button = ttk.Button(button_row, text="Search LanceDB", command=self.on_search)
+        search_button = ttk.Button(button_row, text="Search Vector DB", command=self.on_search)
         search_button.pack(side=tk.LEFT, padx=(8, 0))
 
         ask_button = ttk.Button(button_row, text="Ask LLM", command=self.on_ask)

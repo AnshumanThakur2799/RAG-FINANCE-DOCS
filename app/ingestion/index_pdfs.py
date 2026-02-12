@@ -10,7 +10,7 @@ from typing import Iterator
 
 from app.config import Settings
 from app.db.sqlite_store import ChunkRecord, DocumentRecord, SQLiteDocumentStore
-from app.db.vector_store import LanceDBVectorStore
+from app.db.vector_store import VectorStore, build_vector_store
 from app.embeddings.client import build_embedding_client
 from app.ingestion.chunker import TokenChunker
 from app.ingestion.pdf_reader import extract_text_from_pdf
@@ -49,7 +49,7 @@ def index_pdf(
     *,
     chunker: TokenChunker,
     embed_client,
-    vector_store: LanceDBVectorStore,
+    vector_store: VectorStore,
     store: SQLiteDocumentStore,
     reindex: bool,
     embed_batch_size: int,
@@ -125,7 +125,7 @@ def index_pdf(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Index PDFs into LanceDB and track metadata in SQLite."
+        description="Index PDFs into configured vector DB and track metadata in SQLite."
     )
     parser.add_argument(
         "--input",
@@ -135,7 +135,7 @@ def main() -> None:
     parser.add_argument(
         "--table",
         default="document_chunks",
-        help="LanceDB table name.",
+        help="Vector collection/table name.",
     )
     parser.add_argument(
         "--reindex",
@@ -158,7 +158,7 @@ def main() -> None:
         "--no-table-recreate-on-dim-mismatch",
         action="store_true",
         help=(
-            "Do not recreate LanceDB table when embedding dimension mismatches "
+            "Do not recreate vector collection/table when embedding dimension mismatches "
             "(advanced/debug use)."
         ),
     )
@@ -171,7 +171,7 @@ def main() -> None:
     settings = Settings.from_env()
     input_dir = Path(args.input)
     store = SQLiteDocumentStore(settings.sqlite_db_path)
-    vector_store = LanceDBVectorStore(settings.lancedb_dir, table_name=args.table)
+    vector_store = build_vector_store(settings, table_name=args.table)
     embed_client = build_embedding_client(
         settings.embedding_provider,
         openai_api_key=settings.openai_api_key,

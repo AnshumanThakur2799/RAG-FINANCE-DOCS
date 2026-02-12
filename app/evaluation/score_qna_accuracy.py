@@ -11,7 +11,7 @@ from pathlib import Path
 
 from app.config import Settings
 from app.db.sqlite_store import SQLiteDocumentStore
-from app.db.vector_store import LanceDBVectorStore
+from app.db.vector_store import build_vector_store
 from app.embeddings.client import build_embedding_client
 from app.retrieval import RETRIEVAL_MODES, build_retriever
 
@@ -196,7 +196,7 @@ def main() -> None:
     parser.add_argument(
         "--table",
         default="document_chunks",
-        help="LanceDB table name.",
+        help="Vector collection/table name.",
     )
     parser.add_argument(
         "--question-column",
@@ -265,7 +265,7 @@ def main() -> None:
         local_device=settings.local_embedding_device,
     )
     document_store = SQLiteDocumentStore(settings.sqlite_db_path)
-    vector_store = LanceDBVectorStore(settings.lancedb_dir, table_name=args.table)
+    vector_store = build_vector_store(settings, table_name=args.table)
     retrieval_mode = args.retrieval_mode.strip().lower() or settings.retrieval_mode
     retriever = build_retriever(
         mode=retrieval_mode,
