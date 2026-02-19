@@ -4,6 +4,7 @@ import re
 import tkinter as tk
 from tkinter import ttk
 import time
+from datetime import datetime
 
 from app.config import Settings
 from app.db.sqlite_store import SQLiteDocumentStore
@@ -13,19 +14,20 @@ from app.llm.client import build_llm_client
 from app.retrieval import RETRIEVAL_MODES, build_retriever
 
 
-SYSTEM_PROMPT = (
-    "You are an expert tender reviewer for government tenders in West Bengal. "
-    "The source corpus is from the West Bengal Government e-Procurement portal "
-    "(https://tenders.wb.gov.in/nicgep/app) and includes tenders from multiple "
-    "government organizations, departments, and authorities. "
-    "Answer using only the provided context and do not add facts that are not present. "
-    "Focus on decision-useful details such as eligibility, scope of work, dates, fees, "
-    "submission requirements, evaluation criteria, and compliance risks. "
-    "If the context is insufficient or ambiguous, clearly say you do not have enough information. "
-    "Keep the answer concise and structured. "
-    "Include citations for factual statements in the form [tender_id/source_name#chunk_id]. "
-    "Do not output chain-of-thought, hidden reasoning, or <think> tags."
-)
+SYSTEM_PROMPT = """You are an internal Enterprise AI Assistant for business teams. Use only the provided documents (uploaded files and parsed chunks), and never invent facts.
+
+Mandatory rules:
+- Answer only what the user asked.
+- Cite factual claims using [source#page_or_chunk], with up to the 5 most relevant citations.
+- If context is insufficient, explicitly say "Insufficient information in the provided documents."
+- Keep responses concise, factual, and operational.
+- Do not force templates, JSON, or extra sections unless the user asks for them.
+- No chain-of-thought, no hidden reasoning, no XML tags.
+
+Token/length control:
+- Default budget is 900 tokens unless user requests otherwise.
+- If content is too long, prioritize the direct answer first.
+"""
 
 TENDER_ID_PATTERN = re.compile(r"\d{4}_[A-Za-z0-9]+_\d+_\d+")
 
@@ -266,12 +268,15 @@ class EmbeddingApp:
             context_lines.append(f"[{source}#{chunk_id}] {text}")
         context = "\n\n".join(context_lines)
 
+        # parse now date and time 
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         user_prompt = (
             f"Question:\n{query}\n\n"
             f"Context:\n{context}\n\n"
-            "Answer in plain final form only (no <think> tags). "
-            "Every factual bullet/sentence must include at least one citation in the format "
-            "[tender_id/source_name#chunk_id]."
+            "Answer directly in plain final form only (no <think> tags). "
+            "Include citations for factual statements in the format "
+            "[source_name#chunk_id]."
+            f"Current date and time: {now}"
         )
 
         try:
@@ -298,7 +303,6 @@ class EmbeddingApp:
             f"Retrieval time ({mode}): {search_elapsed:.4f} seconds\n\n"
             f"Answer:\n{answer} \n\n"
             f"LLM call time: {llm_elapsed:.4f} seconds\n\n"
-            f"User prompt: {user_prompt}"
         )
         self._write_output(output)
 

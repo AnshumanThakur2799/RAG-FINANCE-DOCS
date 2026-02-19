@@ -11,6 +11,9 @@ class LLMClient(Protocol):
     def chat(self, system_prompt: str, user_prompt: str) -> str:
         raise NotImplementedError
 
+    def stream_chat(self, system_prompt: str, user_prompt: str):
+        raise NotImplementedError
+
 
 @dataclass
 class DeepInfraChatClient:
@@ -41,6 +44,24 @@ class DeepInfraChatClient:
         )
         content = response.choices[0].message.content or ""
         return self._sanitize_response(content)
+
+    def stream_chat(self, system_prompt: str, user_prompt: str):
+        stream = self._client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=self.max_tokens or None,
+            temperature=self.temperature,
+            stream=True,
+        )
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield str(delta)
 
 
 def build_llm_client(
