@@ -179,3 +179,13 @@ tender_downloads/
 data/
 app/data/
 app/db/
+
+*rag*
+*create*
+*copy*
+tender_downloads/
+mini_tenders_data/
+tender_downloads_chunked/
+tenders_data.csv
+
+data/metadata.db
