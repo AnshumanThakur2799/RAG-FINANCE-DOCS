@@ -172,3 +172,10 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+sample_questions.txt
+tender_downloads/
+
+data/
+app/data/
+app/db/

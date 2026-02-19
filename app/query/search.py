@@ -1,12 +1,54 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 
 from app.config import Settings
 from app.db.sqlite_store import SQLiteDocumentStore
 from app.db.vector_store import build_vector_store
 from app.embeddings.client import build_embedding_client
 from app.retrieval import RETRIEVAL_MODES, build_retriever
+
+
+def _to_epoch(value: str) -> int:
+    parsed = datetime.strptime(value.strip(), "%d-%b-%Y %I:%M %p")
+    return int(parsed.replace(tzinfo=timezone.utc).timestamp())
+
+
+def _build_filters(args: argparse.Namespace) -> dict[str, dict[str, int | str]]:
+    filters: dict[str, dict[str, int | str]] = {}
+
+    if args.organization_eq:
+        filters["organization"] = {"eq": args.organization_eq.strip()}
+    if args.tender_id_eq:
+        filters["tender_id"] = {"eq": args.tender_id_eq.strip()}
+
+    if args.publish_date_after:
+        filters.setdefault("publish_date_epoch", {})["gt"] = _to_epoch(
+            args.publish_date_after
+        )
+    if args.publish_date_before:
+        filters.setdefault("publish_date_epoch", {})["lt"] = _to_epoch(
+            args.publish_date_before
+        )
+    if args.bid_opening_after:
+        filters.setdefault("bid_opening_date_epoch", {})["gt"] = _to_epoch(
+            args.bid_opening_after
+        )
+    if args.bid_opening_before:
+        filters.setdefault("bid_opening_date_epoch", {})["lt"] = _to_epoch(
+            args.bid_opening_before
+        )
+    if args.bid_close_after:
+        filters.setdefault("bid_submission_end_epoch", {})["gt"] = _to_epoch(
+            args.bid_close_after
+        )
+    if args.bid_close_before:
+        filters.setdefault("bid_submission_end_epoch", {})["lt"] = _to_epoch(
+            args.bid_close_before
+        )
+
+    return filters
 
 
 def main() -> None:
@@ -20,6 +62,38 @@ def main() -> None:
         "--retrieval-mode",
         default="",
         help=f"Retrieval mode: {', '.join(RETRIEVAL_MODES)}.",
+    )
+    parser.add_argument("--organization-eq", default="", help="Filter by organization.")
+    parser.add_argument("--tender-id-eq", default="", help="Filter by tender ID.")
+    parser.add_argument(
+        "--publish-date-after",
+        default="",
+        help="Filter publish date greater than this datetime (e.g. 10-Feb-2026 10:00 AM).",
+    )
+    parser.add_argument(
+        "--publish-date-before",
+        default="",
+        help="Filter publish date less than this datetime.",
+    )
+    parser.add_argument(
+        "--bid-opening-after",
+        default="",
+        help="Filter bid opening date greater than this datetime.",
+    )
+    parser.add_argument(
+        "--bid-opening-before",
+        default="",
+        help="Filter bid opening date less than this datetime.",
+    )
+    parser.add_argument(
+        "--bid-close-after",
+        default="",
+        help="Filter bid close (submission end) date greater than this datetime.",
+    )
+    parser.add_argument(
+        "--bid-close-before",
+        default="",
+        help="Filter bid close (submission end) date less than this datetime.",
     )
     args = parser.parse_args()
 
@@ -49,7 +123,12 @@ def main() -> None:
         hybrid_candidate_multiplier=settings.hybrid_candidate_multiplier,
     )
 
-    results = retriever.retrieve(args.query, top_k=max(1, args.top_k))
+    filters = _build_filters(args)
+    results = retriever.retrieve(
+        args.query,
+        top_k=max(1, args.top_k),
+        filters=filters or None,
+    )
 
     if not results:
         print("No results found. Have you indexed PDFs yet?")
@@ -71,6 +150,13 @@ def main() -> None:
         if len(text) > 400:
             text = f"{text[:400]}..."
         print(f"{idx}. {source} (chunk {chunk_id}, score {score_display})")
+        publish_date = result.get("publish_date")
+        bid_close_date = result.get("bid_submission_end")
+        bid_opening_date = result.get("bid_opening_date")
+        if publish_date or bid_close_date or bid_opening_date:
+            print(
+                f"   publish={publish_date or 'n/a'} | bid_close={bid_close_date or 'n/a'} | opening={bid_opening_date or 'n/a'}"
+            )
         print(f"   {text}")
 
 

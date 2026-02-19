@@ -33,7 +33,7 @@ class Settings:
     deepinfra_api_key: str | None
     deepinfra_base_url: str
     deepinfra_model: str
-    llm_max_tokens: int
+    llm_max_tokens: int | None
     llm_temperature: float
     sqlite_db_path: Path
     vector_db_provider: str
@@ -86,7 +86,7 @@ class Settings:
             deepinfra_model=os.getenv(
                 "DEEPINFRA_MODEL", "meta-llama/Meta-Llama-3-8B-Instruct"
             ),
-            llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "512")),
+            llm_max_tokens=os.getenv("LLM_MAX_TOKENS", "None") if os.getenv("LLM_MAX_TOKENS", "None") != "None" else None,
             llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")),
             sqlite_db_path=Path(os.getenv("SQLITE_DB_PATH", sqlite_default)),
             vector_db_provider=os.getenv("VECTOR_DB_PROVIDER", "lancedb"),

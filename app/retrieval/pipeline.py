@@ -8,8 +8,41 @@ from app.db.vector_store import VectorStore
 
 
 class Retriever(Protocol):
-    def retrieve(self, query: str, *, top_k: int) -> list[dict[str, Any]]:
+    def retrieve(
+        self,
+        query: str,
+        *,
+        top_k: int,
+        filters: dict[str, dict[str, Any] | Any] | None = None,
+    ) -> list[dict[str, Any]]:
         raise NotImplementedError
+
+
+def _matches_filters(
+    item: dict[str, Any], filters: dict[str, dict[str, Any] | Any] | None
+) -> bool:
+    if not filters:
+        return True
+    for field, raw_ops in filters.items():
+        if isinstance(raw_ops, dict):
+            ops = raw_ops
+        else:
+            ops = {"eq": raw_ops}
+        item_value = item.get(field)
+        if item_value is None:
+            return False
+        for op, expected in ops.items():
+            if op == "eq" and item_value != expected:
+                return False
+            if op == "gt" and not (item_value > expected):
+                return False
+            if op == "gte" and not (item_value >= expected):
+                return False
+            if op == "lt" and not (item_value < expected):
+                return False
+            if op == "lte" and not (item_value <= expected):
+                return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -17,17 +50,36 @@ class DenseVectorRetriever:
     embed_client: Any
     vector_store: VectorStore
 
-    def retrieve(self, query: str, *, top_k: int) -> list[dict[str, Any]]:
+    def retrieve(
+        self,
+        query: str,
+        *,
+        top_k: int,
+        filters: dict[str, dict[str, Any] | Any] | None = None,
+    ) -> list[dict[str, Any]]:
         embedding = self.embed_client.embed([query], input_type="query")[0]
-        return self.vector_store.search(embedding, top_k=max(1, top_k))
+        return self.vector_store.search(
+            embedding,
+            top_k=max(1, top_k),
+            filters=filters,
+        )
 
 
 @dataclass(frozen=True)
 class LexicalFTSRetriever:
     document_store: SQLiteDocumentStore
 
-    def retrieve(self, query: str, *, top_k: int) -> list[dict[str, Any]]:
-        return self.document_store.search_chunks(query, top_k=max(1, top_k))
+    def retrieve(
+        self,
+        query: str,
+        *,
+        top_k: int,
+        filters: dict[str, dict[str, Any] | Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        results = self.document_store.search_chunks(query, top_k=max(1, top_k))
+        if not filters:
+            return results
+        return [item for item in results if _matches_filters(item, filters)]
 
 
 def reciprocal_rank_fusion(
@@ -68,15 +120,28 @@ class HybridRetriever:
     rrf_k: int = 60
     candidate_multiplier: int = 4
 
-    def retrieve(self, query: str, *, top_k: int) -> list[dict[str, Any]]:
+    def retrieve(
+        self,
+        query: str,
+        *,
+        top_k: int,
+        filters: dict[str, dict[str, Any] | Any] | None = None,
+    ) -> list[dict[str, Any]]:
         candidate_k = max(1, top_k) * max(1, self.candidate_multiplier)
-        dense_results = self.dense_retriever.retrieve(query, top_k=candidate_k)
-        lexical_results = self.lexical_retriever.retrieve(query, top_k=candidate_k)
-        return reciprocal_rank_fusion(
+        dense_results = self.dense_retriever.retrieve(
+            query, top_k=candidate_k, filters=filters
+        )
+        lexical_results = self.lexical_retriever.retrieve(
+            query, top_k=candidate_k, filters=filters
+        )
+        fused = reciprocal_rank_fusion(
             [dense_results, lexical_results],
             top_k=max(1, top_k),
             rrf_k=max(1, self.rrf_k),
         )
+        if not filters:
+            return fused
+        return [item for item in fused if _matches_filters(item, filters)]
 
 
 RETRIEVAL_MODES = ("dense", "lexical", "hybrid")

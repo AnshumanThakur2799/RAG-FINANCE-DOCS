@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import tkinter as tk
 from tkinter import ttk
 import time
@@ -13,10 +14,46 @@ from app.retrieval import RETRIEVAL_MODES, build_retriever
 
 
 SYSTEM_PROMPT = (
-    "You are a finance department assistant. Answer using only the provided context. "
-    "If the context is insufficient, say you do not have enough information. "
-    "Always include citations in the form [source_name#chunk_id]."
+    "You are an expert tender reviewer for government tenders in West Bengal. "
+    "The source corpus is from the West Bengal Government e-Procurement portal "
+    "(https://tenders.wb.gov.in/nicgep/app) and includes tenders from multiple "
+    "government organizations, departments, and authorities. "
+    "Answer using only the provided context and do not add facts that are not present. "
+    "Focus on decision-useful details such as eligibility, scope of work, dates, fees, "
+    "submission requirements, evaluation criteria, and compliance risks. "
+    "If the context is insufficient or ambiguous, clearly say you do not have enough information. "
+    "Keep the answer concise and structured. "
+    "Include citations for factual statements in the form [tender_id/source_name#chunk_id]. "
+    "Do not output chain-of-thought, hidden reasoning, or <think> tags."
 )
+
+TENDER_ID_PATTERN = re.compile(r"\d{4}_[A-Za-z0-9]+_\d+_\d+")
+
+
+def _extract_tender_id_from_source_path(source_path: str) -> str | None:
+    match = TENDER_ID_PATTERN.search(source_path)
+    if not match:
+        return None
+    return match.group(0)
+
+
+def _format_citation_source(result: dict) -> str:
+    source = result.get("source_name") or result.get("source_path", "unknown")
+    tender_id = result.get("tender_id")
+    if not tender_id:
+        source_path = result.get("source_path", "")
+        if isinstance(source_path, str) and source_path:
+            tender_id = _extract_tender_id_from_source_path(source_path)
+    if not tender_id:
+        return str(source)
+    source_text = str(source)
+    if source_text.startswith(f"{tender_id}/"):
+        return source_text
+    return f"{tender_id}/{source_text}"
+
+
+def _has_citation(text: str) -> bool:
+    return bool(re.search(r"\[[^\]]+#\d+\]", text))
 
 
 class EmbeddingApp:
@@ -82,7 +119,7 @@ class EmbeddingApp:
         topk_label = ttk.Label(button_row, text="Top K:")
         topk_label.pack(side=tk.LEFT, padx=(16, 4))
 
-        self.topk_var = tk.StringVar(value="3")
+        self.topk_var = tk.StringVar(value="5")
         topk_entry = ttk.Entry(button_row, textvariable=self.topk_var, width=4)
         topk_entry.pack(side=tk.LEFT)
 
@@ -163,7 +200,7 @@ class EmbeddingApp:
 
         lines = ["Top matches:"]
         for idx, result in enumerate(results, start=1):
-            source = result.get("source_name") or result.get("source_path", "unknown")
+            source = _format_citation_source(result)
             chunk_id = result.get("chunk_id", "n/a")
             score = result.get(
                 "_rrf_score",
@@ -223,7 +260,7 @@ class EmbeddingApp:
 
         context_lines = []
         for result in results:
-            source = result.get("source_name") or result.get("source_path", "unknown")
+            source = _format_citation_source(result)
             chunk_id = result.get("chunk_id", "n/a")
             text = (result.get("text") or "").strip()
             context_lines.append(f"[{source}#{chunk_id}] {text}")
@@ -232,7 +269,9 @@ class EmbeddingApp:
         user_prompt = (
             f"Question:\n{query}\n\n"
             f"Context:\n{context}\n\n"
-            "Answer with citations."
+            "Answer in plain final form only (no <think> tags). "
+            "Every factual bullet/sentence must include at least one citation in the format "
+            "[tender_id/source_name#chunk_id]."
         )
 
         try:
@@ -243,10 +282,23 @@ class EmbeddingApp:
             self._write_output(f"LLM call failed: {exc}")
             return
 
+        if not _has_citation(answer):
+            fallback_sources = []
+            for result in results[:3]:
+                source = _format_citation_source(result)
+                chunk_id = result.get("chunk_id", "n/a")
+                fallback_sources.append(f"[{source}#{chunk_id}]")
+            if fallback_sources:
+                answer = (
+                    f"{answer}\n\nCitations: "
+                    + ", ".join(dict.fromkeys(fallback_sources))
+                )
+
         output = (
             f"Retrieval time ({mode}): {search_elapsed:.4f} seconds\n\n"
             f"Answer:\n{answer} \n\n"
-            f"LLM call time: {llm_elapsed:.4f} seconds"
+            f"LLM call time: {llm_elapsed:.4f} seconds\n\n"
+            f"User prompt: {user_prompt}"
         )
         self._write_output(output)
 

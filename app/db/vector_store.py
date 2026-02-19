@@ -28,12 +28,38 @@ class VectorStore(Protocol):
     ) -> None:
         raise NotImplementedError
 
-    def search(self, vector: list[float], *, top_k: int = 5) -> list[dict]:
+    def search(
+        self,
+        vector: list[float],
+        *,
+        top_k: int = 5,
+        filters: dict[str, dict[str, Any] | Any] | None = None,
+    ) -> list[dict]:
         raise NotImplementedError
 
 
+def _normalize_filters(
+    filters: dict[str, dict[str, Any] | Any] | None,
+) -> dict[str, dict[str, Any]]:
+    if not filters:
+        return {}
+    normalized: dict[str, dict[str, Any]] = {}
+    for key, raw_value in filters.items():
+        if isinstance(raw_value, dict):
+            operations = {
+                op: value
+                for op, value in raw_value.items()
+                if op in {"eq", "gt", "gte", "lt", "lte"} and value is not None
+            }
+            if operations:
+                normalized[key] = operations
+        elif raw_value is not None:
+            normalized[key] = {"eq": raw_value}
+    return normalized
+
+
 class LanceDBVectorStore:
-    def __init__(self, db_dir: Path, table_name: str = "document_chunks") -> None:
+    def __init__(self, db_dir: Path, table_name: str = "tender_chunks") -> None:
         self.db_dir = db_dir
         self.db_dir.mkdir(parents=True, exist_ok=True)
         self.table_name = table_name
@@ -81,19 +107,87 @@ class LanceDBVectorStore:
             )
             self._db.create_table(self.table_name, data=records, mode="overwrite")
 
-    def search(self, vector: list[float], *, top_k: int = 5) -> list[dict]:
+    def search(
+        self,
+        vector: list[float],
+        *,
+        top_k: int = 5,
+        filters: dict[str, dict[str, Any] | Any] | None = None,
+    ) -> list[dict]:
         if not self._table_exists():
             return []
         table = self._db.open_table(self.table_name)
-        return table.search(vector).limit(top_k).to_list()
+        query = table.search(vector)
+        normalized_filters = _normalize_filters(filters)
+        if normalized_filters:
+            clauses: list[str] = []
+            for field, ops in normalized_filters.items():
+                for op, value in ops.items():
+                    if op == "eq":
+                        operator = "="
+                    elif op == "gt":
+                        operator = ">"
+                    elif op == "gte":
+                        operator = ">="
+                    elif op == "lt":
+                        operator = "<"
+                    elif op == "lte":
+                        operator = "<="
+                    else:
+                        continue
+
+                    if isinstance(value, str):
+                        safe = value.replace("'", "''")
+                        clauses.append(f"{field} {operator} '{safe}'")
+                    elif isinstance(value, bool):
+                        clauses.append(f"{field} {operator} {str(value).lower()}")
+                    else:
+                        clauses.append(f"{field} {operator} {value}")
+            if clauses:
+                query = query.where(" AND ".join(clauses))
+        return query.limit(top_k).to_list()
 
 
 class QdrantVectorStore:
+    @staticmethod
+    def _build_qdrant_filter(
+        filters: dict[str, dict[str, Any] | Any] | None,
+    ) -> qmodels.Filter | None:
+        normalized_filters = _normalize_filters(filters)
+        if not normalized_filters:
+            return None
+
+        must_conditions: list[qmodels.Condition] = []
+        for field, ops in normalized_filters.items():
+            if "eq" in ops:
+                must_conditions.append(
+                    qmodels.FieldCondition(
+                        key=field,
+                        match=qmodels.MatchValue(value=ops["eq"]),
+                    )
+                )
+            range_args: dict[str, float | int] = {}
+            if "gt" in ops:
+                range_args["gt"] = ops["gt"]
+            if "gte" in ops:
+                range_args["gte"] = ops["gte"]
+            if "lt" in ops:
+                range_args["lt"] = ops["lt"]
+            if "lte" in ops:
+                range_args["lte"] = ops["lte"]
+            if range_args:
+                must_conditions.append(
+                    qmodels.FieldCondition(key=field, range=qmodels.Range(**range_args))
+                )
+        if not must_conditions:
+            return None
+        return qmodels.Filter(must=must_conditions)
+
     def __init__(
         self,
         *,
         url: str,
-        collection_name: str = "document_chunks",
+        collection_name: str = "tender_chunks",
         api_key: str | None = None,
         timeout_seconds: float = 30.0,
         prefer_grpc: bool = False,
@@ -192,12 +286,7 @@ class QdrantVectorStore:
                 id=self._to_point_id(str(record["id"])),
                 vector=record["vector"],
                 payload={
-                    "id": record.get("id"),
-                    "doc_id": record.get("doc_id"),
-                    "chunk_id": record.get("chunk_id"),
-                    "text": record.get("text"),
-                    "source_path": record.get("source_path"),
-                    "source_name": record.get("source_name"),
+                    key: value for key, value in record.items() if key != "vector"
                 },
             )
             for record in records
@@ -218,11 +307,18 @@ class QdrantVectorStore:
             self._recreate_collection(dim)
             self._client.upsert(collection_name=self.collection_name, points=points)
 
-    def search(self, vector: list[float], *, top_k: int = 5) -> list[dict]:
+    def search(
+        self,
+        vector: list[float],
+        *,
+        top_k: int = 5,
+        filters: dict[str, dict[str, Any] | Any] | None = None,
+    ) -> list[dict]:
         if not self._collection_exists():
             return []
 
         limit = max(1, top_k)
+        query_filter = self._build_qdrant_filter(filters)
         # qdrant-client API differs across versions:
         # - older: client.search(...)
         # - newer: client.query_points(...)
@@ -231,6 +327,7 @@ class QdrantVectorStore:
                 collection_name=self.collection_name,
                 query_vector=vector,
                 limit=limit,
+                query_filter=query_filter,
                 with_payload=True,
                 with_vectors=False,
             )
@@ -239,6 +336,7 @@ class QdrantVectorStore:
                 collection_name=self.collection_name,
                 query=vector,
                 limit=limit,
+                query_filter=query_filter,
                 with_payload=True,
                 with_vectors=False,
             )
@@ -247,21 +345,14 @@ class QdrantVectorStore:
         items: list[dict] = []
         for hit in results:
             payload = dict(hit.payload or {})
-            items.append(
-                {
-                    "id": str(payload.get("id") or hit.id),
-                    "doc_id": payload.get("doc_id"),
-                    "chunk_id": payload.get("chunk_id"),
-                    "text": payload.get("text"),
-                    "source_path": payload.get("source_path"),
-                    "source_name": payload.get("source_name"),
-                    "score": float(hit.score),
-                }
-            )
+            item = dict(payload)
+            item["id"] = str(payload.get("id") or hit.id)
+            item["score"] = float(hit.score)
+            items.append(item)
         return items
 
 
-def build_vector_store(settings: "Settings", *, table_name: str = "document_chunks") -> VectorStore:
+def build_vector_store(settings: "Settings", *, table_name: str = "tender_chunks") -> VectorStore:
     provider = settings.vector_db_provider.strip().lower()
     if provider == "lancedb":
         return LanceDBVectorStore(settings.lancedb_dir, table_name=table_name)
