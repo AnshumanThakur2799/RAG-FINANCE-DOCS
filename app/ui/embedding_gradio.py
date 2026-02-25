@@ -10,7 +10,11 @@ from app.db.sqlite_store import SQLiteDocumentStore
 from app.db.vector_store import build_vector_store
 from app.embeddings.client import build_embedding_client
 from app.llm.client import build_llm_client
-from app.retrieval import RETRIEVAL_MODES, build_retriever
+from app.retrieval import (
+    RETRIEVAL_MODES,
+    build_full_tender_context,
+    build_retriever,
+)
 
 
 SYSTEM_PROMPT = """
@@ -98,10 +102,11 @@ class EmbeddingGradioApp:
             local_model=settings.local_embedding_model,
             local_normalize=settings.local_embedding_normalize,
             local_prompt_style=settings.local_embedding_prompt_style,
-            local_device=settings.local_embedding_device,
+            local_device=settings.local_embedding_device,\
+            deepinfra_base_url=settings.deepinfra_base_url,
         )
         self.document_store = SQLiteDocumentStore(settings.sqlite_db_path)
-        self.vector_store = build_vector_store(settings, table_name="document_chunks")
+        self.vector_store = build_vector_store(settings, table_name="tenders_data")
         self.llm_client = build_llm_client(
             settings.llm_provider,
             deepinfra_api_key=settings.deepinfra_api_key,
@@ -213,13 +218,11 @@ class EmbeddingGradioApp:
         if not results:
             return "No results found. Have you indexed PDFs yet?"
 
-        context_lines = []
-        for result in results:
-            source = _format_citation_source(result)
-            chunk_id = result.get("chunk_id", "n/a")
-            text = (result.get("text") or "").strip()
-            context_lines.append(f"[{source}#{chunk_id}] {text}")
-        context = "\n\n".join(context_lines)
+        context, selected_tender_ids = build_full_tender_context(
+            results=results,
+            document_store=self.document_store,
+            max_unique_tenders=3,
+        )
 
         user_prompt = _build_ask_user_prompt(query, context)
 
@@ -232,10 +235,13 @@ class EmbeddingGradioApp:
 
         if not _has_citation(answer):
             fallback_sources = []
-            for result in results[:3]:
-                source = _format_citation_source(result)
-                chunk_id = result.get("chunk_id", "n/a")
-                fallback_sources.append(f"[{source}#{chunk_id}]")
+            if selected_tender_ids:
+                fallback_sources = [f"[{tender_id}/full_text#full]" for tender_id in selected_tender_ids]
+            else:
+                for result in results[:3]:
+                    source = _format_citation_source(result)
+                    chunk_id = result.get("chunk_id", "n/a")
+                    fallback_sources.append(f"[{source}#{chunk_id}]")
             if fallback_sources:
                 answer = f"{answer}\n\nCitations: " + ", ".join(dict.fromkeys(fallback_sources))
 
@@ -271,13 +277,11 @@ class EmbeddingGradioApp:
             yield "No results found. Have you indexed PDFs yet?"
             return
 
-        context_lines = []
-        for result in results:
-            source = _format_citation_source(result)
-            chunk_id = result.get("chunk_id", "n/a")
-            text = (result.get("text") or "").strip()
-            context_lines.append(f"[{source}#{chunk_id}] {text}")
-        context = "\n\n".join(context_lines)
+        context, selected_tender_ids = build_full_tender_context(
+            results=results,
+            document_store=self.document_store,
+            max_unique_tenders=3,
+        )
 
         user_prompt = _build_ask_user_prompt(query, context)
         yield "Generating..."
@@ -298,10 +302,13 @@ class EmbeddingGradioApp:
 
         if not _has_citation(answer):
             fallback_sources = []
-            for result in results[:3]:
-                source = _format_citation_source(result)
-                chunk_id = result.get("chunk_id", "n/a")
-                fallback_sources.append(f"[{source}#{chunk_id}]")
+            if selected_tender_ids:
+                fallback_sources = [f"[{tender_id}/full_text#full]" for tender_id in selected_tender_ids]
+            else:
+                for result in results[:3]:
+                    source = _format_citation_source(result)
+                    chunk_id = result.get("chunk_id", "n/a")
+                    fallback_sources.append(f"[{source}#{chunk_id}]")
             if fallback_sources:
                 answer = f"{answer}\n\nCitations: " + ", ".join(dict.fromkeys(fallback_sources))
 

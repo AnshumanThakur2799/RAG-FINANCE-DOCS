@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,7 +22,7 @@ from app.ingestion.index_pdfs import (
     iter_pdf_paths,
     load_tender_metadata_index,
 )
-from app.ingestion.pdf_reader import extract_text_from_pdf
+from app.ingestion.pdf_reader_llm import build_pdf_text_extractor
 
 
 @dataclass
@@ -70,13 +71,14 @@ async def _prepare_pdf_payload(
     metadata_by_path: dict[str, TenderMetadata],
     metadata_by_tender_id: dict[str, TenderMetadata],
     reindex: bool,
+    text_extractor: Callable[[Path], str],
 ) -> tuple[IndexResult, _PreparedIndexPayload | None]:
     file_hash = await asyncio.to_thread(compute_file_hash, path)
     existing = await asyncio.to_thread(store.get_by_hash, file_hash)
     if existing and not reindex:
         return IndexResult(indexed=False, num_chunks=0, status="already_indexed"), None
 
-    text = await asyncio.to_thread(extract_text_from_pdf, path)
+    text = await asyncio.to_thread(text_extractor, path)
     if not text:
         return IndexResult(indexed=False, num_chunks=0, status="empty_pdf"), None
 
@@ -189,6 +191,7 @@ async def _index_one_pdf(
     reindex: bool,
     embed_batch_size: int,
     recreate_table_on_dim_mismatch: bool,
+    text_extractor: Callable[[Path], str],
 ) -> tuple[IndexResult, float]:
     file_start = time.perf_counter()
     async with semaphore:
@@ -202,6 +205,7 @@ async def _index_one_pdf(
             metadata_by_path=metadata_by_path,
             metadata_by_tender_id=metadata_by_tender_id,
             reindex=reindex,
+            text_extractor=text_extractor,
         )
 
     if not prepared_result.indexed or payload is None:
@@ -255,10 +259,15 @@ async def _run_async_indexing(args: argparse.Namespace) -> None:
         local_normalize=settings.local_embedding_normalize,
         local_prompt_style=settings.local_embedding_prompt_style,
         local_device=settings.local_embedding_device,
+        deepinfra_base_url=settings.deepinfra_base_url,
     )
     chunker = TokenChunker(
         chunk_size=settings.chunk_size_tokens,
         overlap=settings.chunk_overlap_tokens,
+    )
+    text_extractor = build_pdf_text_extractor(
+        settings,
+        reader_mode=args.pdf_reader_mode,
     )
 
     all_pdfs = list(iter_pdf_paths(input_dir))
@@ -303,6 +312,7 @@ async def _run_async_indexing(args: argparse.Namespace) -> None:
                 recreate_table_on_dim_mismatch=(
                     args.reindex and not args.no_table_recreate_on_dim_mismatch
                 ),
+                text_extractor=text_extractor,
             )
         )
         for file_number, pdf_path in enumerate(all_pdfs, start=1)
@@ -356,7 +366,7 @@ def main() -> None:
     )
     parser.add_argument("--input", required=True, help="Folder containing PDFs to index.")
     parser.add_argument(
-        "--table", default="tender_chunks", help="Vector collection/table name."
+        "--table", default="min_data_set", help="Vector collection/table name."
     )
     parser.add_argument(
         "--reindex",
@@ -396,6 +406,16 @@ def main() -> None:
         "--metadata-csv",
         default="tenders_data.csv",
         help="CSV file containing tender metadata to attach to each indexed chunk.",
+    )
+    parser.add_argument(
+        "--pdf-reader-mode",
+        default="baseline",
+        choices=["baseline", "llm", "llm_vision"],
+        help=(
+            "PDF reader mode: 'baseline' uses deterministic extraction, "
+            "'llm' runs text reconstruction with the configured LLM, "
+            "'llm_vision' renders PDF pages as images and uses multimodal LLM input."
+        ),
     )
     args = parser.parse_args()
 

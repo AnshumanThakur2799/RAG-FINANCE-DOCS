@@ -1,0 +1,931 @@
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import re
+import time
+from functools import lru_cache
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterator
+
+import tiktoken
+
+from app.config import Settings
+from app.db.sqlite_store import (
+    ChunkMetadataRecord,
+    ChunkRecord,
+    DocumentRecord,
+    SQLiteDocumentStore,
+    TenderTextRecord,
+)
+from app.db.vector_store import VectorStore, build_vector_store
+from app.embeddings.client import build_embedding_client
+from app.ingestion.chunker import TokenChunker
+from app.ingestion.index_pdfs import (
+    TenderMetadata,
+    _extract_tender_id_from_path,
+    _normalize_path_value,
+    batch_items,
+    load_tender_metadata_index,
+)
+
+
+@dataclass(frozen=True)
+class IndexResult:
+    indexed: bool
+    num_chunks: int
+    status: str
+
+
+@dataclass(frozen=True)
+class ChunkForIndexing:
+    retrieval_text: str
+    raw_table_json: str | None = None
+
+
+def iter_text_paths(input_dir: Path) -> Iterator[Path]:
+    if not input_dir.exists():
+        raise FileNotFoundError(f"Input folder not found: {input_dir}")
+    for path in sorted(input_dir.rglob("*.txt")):
+        if path.is_file():
+            yield path
+
+
+def compute_file_hash(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _is_table_object(obj: object) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    return (
+        "columns" in obj
+        and "rows" in obj
+        and isinstance(obj.get("columns"), list)
+        and isinstance(obj.get("rows"), list)
+    )
+
+
+def _extract_table_ranges(text: str) -> list[tuple[int, int]]:
+    decoder = json.JSONDecoder()
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    text_len = len(text)
+
+    while cursor < text_len:
+        start = text.find("{", cursor)
+        if start == -1:
+            break
+        try:
+            obj, relative_end = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            cursor = start + 1
+            continue
+
+        end = start + relative_end
+        if _is_table_object(obj):
+            ranges.append((start, end))
+            cursor = end
+        else:
+            cursor = start + 1
+
+    return ranges
+
+
+_PAGE_MARKER_RE = re.compile(
+    r"^(?:contd\.?\s*/\s*)?page\s*[-:]?\s*\d+\s*$",
+    re.IGNORECASE,
+)
+_DOT_LEADER_RE = re.compile(r"^[\.\-`'\"~_=\s]+$")
+_WORD_RE = re.compile(r"\b[\w]+\b", re.UNICODE)
+_SMALL_TITLE_RE = re.compile(r"^[A-Z0-9:,\- ]+$")
+
+
+def _is_noise_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if _PAGE_MARKER_RE.match(stripped):
+        return True
+    if _DOT_LEADER_RE.match(stripped) and len(re.sub(r"\s+", "", stripped)) >= 12:
+        return True
+    return False
+
+
+def _clean_inter_table_text(text: str) -> str:
+    kept_lines = [line for line in text.splitlines() if not _is_noise_line(line)]
+    return "\n".join(kept_lines).strip()
+
+
+def _is_low_value_chunk(
+    chunk: str,
+    *,
+    min_short_chunk_chars: int,
+    long_punctuation_min_chars: int,
+    max_punctuation_ratio: float,
+) -> bool:
+    stripped = chunk.strip()
+    if not stripped:
+        return True
+
+    compact = "".join(stripped.split())
+    if not compact:
+        return True
+
+    if _PAGE_MARKER_RE.match(stripped):
+        return True
+    if _DOT_LEADER_RE.match(stripped) and len(compact) >= 12:
+        return True
+
+    word_count = len(_WORD_RE.findall(stripped))
+    alnum_count = sum(char.isalnum() for char in compact)
+    punct_count = len(compact) - alnum_count
+
+    # Character-size based guardrail: tiny 1-2 word chunks are usually low value.
+    if word_count <= 6 and len(compact) < min_short_chunk_chars:
+        return True
+
+    # Remove long punctuation-heavy OCR artifacts.
+    if len(compact) >= long_punctuation_min_chars:
+        punctuation_ratio = punct_count / max(1, len(compact))
+        if punctuation_ratio >= max_punctuation_ratio and alnum_count < 8:
+            return True
+
+    return False
+
+
+@lru_cache(maxsize=4)
+def _get_encoding(encoding_name: str):
+    return tiktoken.get_encoding(encoding_name)
+
+
+def _token_count(text: str, *, encoding_name: str) -> int:
+    return len(_get_encoding(encoding_name).encode(text))
+
+
+def _is_table_chunk_text(chunk: str) -> bool:
+    stripped = chunk.strip()
+    if not stripped.startswith("{") or not stripped.endswith("}"):
+        return False
+    try:
+        obj = json.loads(stripped)
+    except json.JSONDecodeError:
+        return False
+    return _is_table_object(obj)
+
+
+def _table_value_to_text(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _parse_table_json_preserving_number_text(raw_table_json: str) -> dict | None:
+    try:
+        parsed = json.loads(
+            raw_table_json,
+            parse_int=lambda token: token,
+            parse_float=lambda token: token,
+        )
+    except json.JSONDecodeError:
+        return None
+    if not _is_table_object(parsed):
+        return None
+    return parsed
+
+
+def _table_json_to_single_passage(raw_table_json: str) -> str:
+    parsed_table = _parse_table_json_preserving_number_text(raw_table_json)
+    if not parsed_table:
+        return raw_table_json.strip()
+
+    raw_columns = parsed_table.get("columns") or []
+    columns = [str(column) for column in raw_columns]
+    columns_section = "; ".join(columns)
+    prefix = f"Columns: {columns_section}. Rows:"
+
+    row_sections: list[str] = []
+    raw_rows = parsed_table.get("rows") or []
+    for row_index, raw_row in enumerate(raw_rows, start=1):
+        if isinstance(raw_row, dict):
+            row_values = [
+                f"{column}: {_table_value_to_text(raw_row.get(column, ''))}"
+                for column in columns
+            ]
+            row_sections.append(f"{row_index} — " + "; ".join(row_values) + ".")
+        else:
+            row_sections.append(
+                f"{row_index} — value: {_table_value_to_text(raw_row)}."
+            )
+    if not row_sections:
+        return prefix
+    return f"{prefix} {' '.join(row_sections)}"
+
+
+def _prepare_chunks_for_retrieval(chunks: list[str]) -> list[ChunkForIndexing]:
+    prepared: list[ChunkForIndexing] = []
+    for chunk in chunks:
+        stripped = chunk.strip()
+        parsed_table = _parse_table_json_preserving_number_text(stripped)
+        if not parsed_table:
+            prepared.append(ChunkForIndexing(retrieval_text=chunk))
+            continue
+        prepared.append(
+            ChunkForIndexing(
+                retrieval_text=_table_json_to_single_passage(stripped),
+                raw_table_json=stripped,
+            )
+        )
+    return prepared
+
+
+def _render_chunk_with_small_titles(text: str, small_titles: list[str]) -> str:
+    if not small_titles:
+        return text.strip()
+    title_prefix = "\n".join(f"[TITLE] {title}" for title in small_titles)
+    return f"{title_prefix}\n\n{text.strip()}".strip()
+
+
+def _merge_small_chunks_in_group(
+    group_chunks: list[str],
+    *,
+    min_tokens: int,
+    small_title_max_tokens: int,
+    encoding_name: str,
+) -> list[str]:
+    merged: list[dict[str, list[str] | str]] = []
+    pending_titles: list[str] = []
+    pending_prefix: list[str] = []
+
+    for chunk in group_chunks:
+        stripped = chunk.strip()
+        if not stripped:
+            continue
+
+        token_count = _token_count(stripped, encoding_name=encoding_name)
+        if (
+            token_count <= small_title_max_tokens
+            and _SMALL_TITLE_RE.match(stripped)
+            and any(ch.isalpha() for ch in stripped)
+        ):
+            if merged:
+                cast_titles = merged[-1]["small_titles"]
+                assert isinstance(cast_titles, list)
+                cast_titles.append(stripped)
+            else:
+                pending_titles.append(stripped)
+            continue
+
+        if token_count < min_tokens:
+            if merged:
+                cast_text = merged[-1]["text"]
+                assert isinstance(cast_text, str)
+                merged[-1]["text"] = f"{cast_text.rstrip()}\n{stripped}"
+            else:
+                pending_prefix.append(stripped)
+            continue
+
+        composed_text = stripped
+        if pending_prefix:
+            composed_text = "\n".join(pending_prefix + [composed_text])
+            pending_prefix = []
+
+        chunk_titles = pending_titles
+        pending_titles = []
+        merged.append({"text": composed_text, "small_titles": chunk_titles})
+
+    if pending_titles:
+        if merged:
+            cast_titles = merged[-1]["small_titles"]
+            assert isinstance(cast_titles, list)
+            cast_titles.extend(pending_titles)
+        else:
+            pending_prefix.extend(pending_titles)
+    if pending_prefix:
+        if merged:
+            cast_text = merged[-1]["text"]
+            assert isinstance(cast_text, str)
+            merged[-1]["text"] = f"{cast_text.rstrip()}\n" + "\n".join(pending_prefix)
+        else:
+            merged.append({"text": "\n".join(pending_prefix), "small_titles": []})
+
+    output: list[str] = []
+    for item in merged:
+        cast_text = item["text"]
+        cast_titles = item["small_titles"]
+        assert isinstance(cast_text, str)
+        assert isinstance(cast_titles, list)
+        output.append(_render_chunk_with_small_titles(cast_text, cast_titles))
+    return output
+
+
+def merge_small_chunks(
+    chunks: list[str],
+    *,
+    min_tokens: int,
+    small_title_max_tokens: int,
+    encoding_name: str,
+) -> list[str]:
+    if not chunks:
+        return []
+
+    merged_output: list[str] = []
+    current_group: list[str] = []
+    current_is_table: bool | None = None
+
+    for chunk in chunks:
+        is_table = _is_table_chunk_text(chunk)
+        if current_is_table is None:
+            current_is_table = is_table
+        if is_table != current_is_table:
+            merged_output.extend(
+                _merge_small_chunks_in_group(
+                    current_group,
+                    min_tokens=min_tokens,
+                    small_title_max_tokens=small_title_max_tokens,
+                    encoding_name=encoding_name,
+                )
+            )
+            current_group = []
+            current_is_table = is_table
+        current_group.append(chunk)
+
+    if current_group:
+        merged_output.extend(
+            _merge_small_chunks_in_group(
+                current_group,
+                min_tokens=min_tokens,
+                small_title_max_tokens=small_title_max_tokens,
+                encoding_name=encoding_name,
+            )
+        )
+    return merged_output
+
+
+def chunk_text_preserving_tables(
+    text: str,
+    *,
+    chunker: TokenChunker,
+    table_parse_max_chars: int,
+    tender_id: str,
+    source_name: str,
+) -> list[str]:
+    if len(text) > table_parse_max_chars:
+        logging.warning(
+            "Skipping table-preserving parse | tender_id=%s | file=%s | chars=%s > %s. "
+            "Using normal chunking path.",
+            tender_id,
+            source_name,
+            len(text),
+            table_parse_max_chars,
+        )
+        return chunker.chunk(text)
+
+    table_ranges = _extract_table_ranges(text)
+    if not table_ranges:
+        return chunker.chunk(text)
+
+    chunks: list[str] = []
+    cursor = 0
+    for start, end in table_ranges:
+        if start > cursor:
+            normal_text = _clean_inter_table_text(text[cursor:start])
+            if normal_text:
+                chunks.extend(chunker.chunk(normal_text))
+        table_text = text[start:end].strip()
+        if table_text:
+            chunks.append(table_text)
+        cursor = end
+
+    if cursor < len(text):
+        tail_text = _clean_inter_table_text(text[cursor:])
+        if tail_text:
+            chunks.extend(chunker.chunk(tail_text))
+    return chunks
+
+
+def chunk_text_fast_by_chars(
+    text: str,
+    *,
+    chunk_size_chars: int,
+    overlap_chars: int,
+) -> list[str]:
+    if not text:
+        return []
+    if overlap_chars >= chunk_size_chars:
+        raise ValueError("Fast chunk overlap must be smaller than chunk size.")
+
+    step = chunk_size_chars - overlap_chars
+    chunks: list[str] = []
+    for start in range(0, len(text), step):
+        end = min(len(text), start + chunk_size_chars)
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= len(text):
+            break
+    return chunks
+
+
+def _find_metadata_for_text_path(
+    *,
+    path: Path,
+    input_root: Path,
+    metadata_by_path: dict[str, TenderMetadata],
+    metadata_by_tender_id: dict[str, TenderMetadata],
+) -> tuple[TenderMetadata | None, str]:
+    metadata: TenderMetadata | None = None
+    try:
+        rel = path.relative_to(input_root).as_posix()
+        as_pdf_rel = str(Path(rel).with_suffix(".pdf"))
+        metadata = metadata_by_path.get(_normalize_path_value(as_pdf_rel))
+    except ValueError:
+        pass
+
+    tender_id = _extract_tender_id_from_path(path) or "unknown"
+    if metadata is None and tender_id != "unknown":
+        metadata = metadata_by_tender_id.get(tender_id)
+    if metadata and metadata.tender_id:
+        tender_id = metadata.tender_id
+
+    return metadata, tender_id
+
+
+def index_text_file(
+    path: Path,
+    *,
+    input_root: Path,
+    chunker: TokenChunker,
+    embed_client,
+    vector_store: VectorStore,
+    store: SQLiteDocumentStore,
+    metadata_by_path: dict[str, TenderMetadata],
+    metadata_by_tender_id: dict[str, TenderMetadata],
+    reindex: bool,
+    embed_batch_size: int,
+    recreate_table_on_dim_mismatch: bool,
+    table_parse_max_chars: int,
+    fast_chunk_threshold_chars: int,
+    fast_chunk_size_chars: int,
+    fast_chunk_overlap_chars: int,
+    min_short_chunk_chars: int,
+    long_punctuation_min_chars: int,
+    max_punctuation_ratio: float,
+    min_merge_tokens: int,
+    small_title_max_tokens: int,
+) -> IndexResult:
+    file_hash = compute_file_hash(path)
+    existing = store.get_by_hash(file_hash)
+    if existing and not reindex:
+        return IndexResult(indexed=False, num_chunks=0, status="already_indexed")
+
+    read_start = time.perf_counter()
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return IndexResult(indexed=False, num_chunks=0, status="empty_text")
+    logging.info(
+        "Loaded %s | chars=%s | read_time=%.2fs",
+        path.name,
+        len(text),
+        time.perf_counter() - read_start,
+    )
+
+    metadata, tender_id = _find_metadata_for_text_path(
+        path=path,
+        input_root=input_root,
+        metadata_by_path=metadata_by_path,
+        metadata_by_tender_id=metadata_by_tender_id,
+    )
+
+    chunk_start = time.perf_counter()
+    if len(text) > fast_chunk_threshold_chars:
+        logging.warning(
+            "Using fast char-based chunking | tender_id=%s | file=%s | chars=%s > %s.",
+            tender_id,
+            path.name,
+            len(text),
+            fast_chunk_threshold_chars,
+        )
+        chunks = chunk_text_fast_by_chars(
+            text,
+            chunk_size_chars=fast_chunk_size_chars,
+            overlap_chars=fast_chunk_overlap_chars,
+        )
+    else:
+        chunks = chunk_text_preserving_tables(
+            text,
+            chunker=chunker,
+            table_parse_max_chars=table_parse_max_chars,
+            tender_id=tender_id,
+            source_name=path.name,
+        )
+    before_filter_count = len(chunks)
+    chunks = [
+        chunk
+        for chunk in chunks
+        if _is_table_chunk_text(chunk)
+        or not _is_low_value_chunk(
+            chunk,
+            min_short_chunk_chars=min_short_chunk_chars,
+            long_punctuation_min_chars=long_punctuation_min_chars,
+            max_punctuation_ratio=max_punctuation_ratio,
+        )
+    ]
+    dropped_count = before_filter_count - len(chunks)
+    if dropped_count:
+        logging.info(
+            "Dropped low-value chunks | file=%s | dropped=%s | kept=%s",
+            path.name,
+            dropped_count,
+            len(chunks),
+        )
+    before_merge_count = len(chunks)
+    chunks = merge_small_chunks(
+        chunks,
+        min_tokens=min_merge_tokens,
+        small_title_max_tokens=small_title_max_tokens,
+        encoding_name=chunker.encoding_name,
+    )
+    merged_delta = before_merge_count - len(chunks)
+    if merged_delta:
+        logging.info(
+            "Merged small chunks | file=%s | reduced_by=%s | final=%s",
+            path.name,
+            merged_delta,
+            len(chunks),
+        )
+    if not chunks:
+        logging.warning(
+            "All chunks filtered out as low-value | file=%s | tender_id=%s",
+            path.name,
+            tender_id,
+        )
+        return IndexResult(indexed=False, num_chunks=0, status="all_chunks_filtered")
+    logging.info(
+        "Chunked %s | chunks=%s | chunk_time=%.2fs",
+        path.name,
+        len(chunks),
+        time.perf_counter() - chunk_start,
+    )
+    chunk_payloads = _prepare_chunks_for_retrieval(chunks)
+    chunk_texts_for_embedding = [item.retrieval_text for item in chunk_payloads]
+
+    embeddings: list[list[float]] = []
+    total_batches = max(
+        1, (len(chunk_texts_for_embedding) + embed_batch_size - 1) // embed_batch_size
+    )
+    for batch_number, batch in enumerate(
+        batch_items(chunk_texts_for_embedding, embed_batch_size), start=1
+    ):
+        batch_start = time.perf_counter()
+        embeddings.extend(embed_client.embed(batch, input_type="document"))
+        logging.info(
+            "Embedded %s | batch=%s/%s | batch_chunks=%s | embed_time=%.2fs",
+            path.name,
+            batch_number,
+            total_batches,
+            len(batch),
+            time.perf_counter() - batch_start,
+        )
+    if len(chunk_texts_for_embedding) != len(embeddings):
+        raise RuntimeError("Embedding count mismatch.")
+
+    metadata_payload = metadata.to_payload() if metadata else {}
+    if tender_id != "unknown":
+        metadata_payload.setdefault("tender_id", tender_id)
+
+    doc_id = file_hash
+    vector_store.delete_by_doc_id(doc_id)
+    records = []
+    lexical_records: list[ChunkRecord] = []
+    metadata_records: list[ChunkMetadataRecord] = []
+    for idx, (chunk_payload, embedding) in enumerate(zip(chunk_payloads, embeddings)):
+        chunk_uid = f"{doc_id}::chunk_{idx}"
+        records.append(
+            {
+                "id": chunk_uid,
+                "doc_id": doc_id,
+                "chunk_id": idx,
+                "text": chunk_payload.retrieval_text,
+                "vector": embedding,
+                "source_path": str(path.resolve()),
+                "source_name": path.name,
+                **metadata_payload,
+            }
+        )
+        lexical_records.append(
+            ChunkRecord(
+                id=chunk_uid,
+                doc_id=doc_id,
+                chunk_id=idx,
+                text=chunk_payload.retrieval_text,
+                source_path=str(path.resolve()),
+                source_name=path.name,
+            )
+        )
+        if chunk_payload.raw_table_json:
+            metadata_records.append(
+                ChunkMetadataRecord(
+                    chunk_uid=chunk_uid,
+                    doc_id=doc_id,
+                    raw_table_json=chunk_payload.raw_table_json,
+                )
+            )
+
+    vector_store.upsert_chunks(
+        records, recreate_on_dim_mismatch=recreate_table_on_dim_mismatch
+    )
+    store.replace_chunks(doc_id, lexical_records)
+    store.replace_chunk_metadata(doc_id, metadata_records)
+
+    stat = path.stat()
+    store.upsert_document(
+        DocumentRecord(
+            id=doc_id,
+            file_path=str(path.resolve()),
+            file_name=path.name,
+            file_hash=file_hash,
+            file_size=stat.st_size,
+            modified_time=stat.st_mtime,
+            indexed_at=store.now_iso(),
+            num_chunks=len(chunks),
+        )
+    )
+    if tender_id != "unknown":
+        store.upsert_tender_text(
+            TenderTextRecord(
+                tender_id=tender_id,
+                doc_id=doc_id,
+                source_path=str(path.resolve()),
+                source_name=path.name,
+                full_text=text,
+                metadata=metadata_payload,
+                indexed_at=store.now_iso(),
+            )
+        )
+    return IndexResult(indexed=True, num_chunks=len(chunks), status="indexed")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Index pre-extracted tender text files into vector DB and SQLite."
+    )
+    parser.add_argument(
+        "--input",
+        default="mini_tenders_data_text",
+        help="Folder containing tender text files.",
+    )
+    parser.add_argument(
+        "--table",
+        default="mini_data_text",
+        help="Vector collection/table name.",
+    )
+    parser.add_argument(
+        "--reindex",
+        action="store_true",
+        help="Reindex even if file hash already exists.",
+    )
+    parser.add_argument(
+        "--embed-batch-size",
+        type=int,
+        default=64,
+        help="Number of chunks per embedding request.",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=500,
+        help="Chunk size in tokens for normal text.",
+    )
+    parser.add_argument(
+        "--chunk-overlap",
+        type=int,
+        default=100,
+        help="Token overlap for normal text chunks.",
+    )
+    parser.add_argument(
+        "--metadata-csv",
+        default="tenders_data.csv",
+        help="CSV file containing tender metadata.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging verbosity.",
+    )
+    parser.add_argument(
+        "--no-table-recreate-on-dim-mismatch",
+        action="store_true",
+        help="Do not recreate vector table on embedding dimension mismatch.",
+    )
+    parser.add_argument(
+        "--table-parse-max-chars",
+        type=int,
+        default=600_000,
+        help=(
+            "Skip table-preserving JSON parsing for files larger than this many chars "
+            "to avoid very slow scans on huge OCR text files."
+        ),
+    )
+    parser.add_argument(
+        "--fast-chunk-threshold-chars",
+        type=int,
+        default=2_000_000,
+        help=(
+            "For files larger than this size, use fast char-window chunking "
+            "instead of token-based chunking."
+        ),
+    )
+    parser.add_argument(
+        "--fast-chunk-size-chars",
+        type=int,
+        default=2400,
+        help="Character window size for fast chunking path.",
+    )
+    parser.add_argument(
+        "--fast-chunk-overlap-chars",
+        type=int,
+        default=300,
+        help="Character overlap for fast chunking path.",
+    )
+    parser.add_argument(
+        "--min-short-chunk-chars",
+        type=int,
+        default=50,
+        help=(
+            "Drop chunks with <=6 words if total non-space chars are below this value."
+        ),
+    )
+    parser.add_argument(
+        "--long-punctuation-min-chars",
+        type=int,
+        default=20,
+        help=(
+            "Apply punctuation-noise filtering only to chunks at or above this size."
+        ),
+    )
+    parser.add_argument(
+        "--max-punctuation-ratio",
+        type=float,
+        default=0.60,
+        help="Drop chunks when punctuation ratio meets/exceeds this threshold.",
+    )
+    parser.add_argument(
+        "--min-merge-tokens",
+        type=int,
+        default=40,
+        help=(
+            "Merge chunks smaller than this token count into adjacent chunks "
+            "within the same chunk-type boundary."
+        ),
+    )
+    parser.add_argument(
+        "--small-title-max-tokens",
+        type=int,
+        default=6,
+        help=(
+            "If a chunk is all-caps-ish and at most this many tokens, attach it "
+            "to a neighboring chunk instead of embedding it alone."
+        ),
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper()),
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+
+    settings = Settings.from_env()
+    input_dir = Path(args.input)
+    metadata_csv_path = Path(args.metadata_csv)
+
+    store = SQLiteDocumentStore(settings.sqlite_db_path)
+    vector_store = build_vector_store(settings, table_name=args.table)
+    embed_client = build_embedding_client(
+        settings.embedding_provider,
+        openai_api_key=settings.openai_api_key,
+        openai_model=settings.openai_embedding_model,
+        azure_endpoint=settings.azure_openai_endpoint,
+        azure_api_key=settings.azure_openai_api_key,
+        azure_api_version=settings.azure_openai_api_version,
+        azure_deployment=settings.azure_openai_embeddings_deployment,
+        local_model=settings.local_embedding_model,
+        local_normalize=settings.local_embedding_normalize,
+        local_prompt_style=settings.local_embedding_prompt_style,
+        local_device=settings.local_embedding_device,
+        deepinfra_base_url=settings.deepinfra_base_url,
+    )
+    chunker = TokenChunker(
+        chunk_size=args.chunk_size,
+        overlap=args.chunk_overlap,
+    )
+
+    all_txt = list(iter_text_paths(input_dir))
+    metadata_by_path, metadata_by_tender_id = load_tender_metadata_index(metadata_csv_path)
+    logging.info(
+        "Starting text indexing run | input=%s | total_files=%s | metadata_path_keys=%s | metadata_tender_ids=%s",
+        str(input_dir.resolve()),
+        len(all_txt),
+        len(metadata_by_path),
+        len(metadata_by_tender_id),
+    )
+
+    run_start = time.perf_counter()
+    indexed_count = 0
+    skipped_count = 0
+    failed_count = 0
+    total_chunks_indexed = 0
+
+    for file_number, txt_path in enumerate(all_txt, start=1):
+        file_start = time.perf_counter()
+        try:
+            logging.info(
+                "[%s/%s] Processing %s",
+                file_number,
+                len(all_txt),
+                txt_path.name,
+            )
+            result = index_text_file(
+                txt_path,
+                input_root=input_dir,
+                chunker=chunker,
+                embed_client=embed_client,
+                vector_store=vector_store,
+                store=store,
+                metadata_by_path=metadata_by_path,
+                metadata_by_tender_id=metadata_by_tender_id,
+                reindex=args.reindex,
+                embed_batch_size=args.embed_batch_size,
+                recreate_table_on_dim_mismatch=(
+                    args.reindex and not args.no_table_recreate_on_dim_mismatch
+                ),
+                table_parse_max_chars=args.table_parse_max_chars,
+                fast_chunk_threshold_chars=args.fast_chunk_threshold_chars,
+                fast_chunk_size_chars=args.fast_chunk_size_chars,
+                fast_chunk_overlap_chars=args.fast_chunk_overlap_chars,
+                min_short_chunk_chars=args.min_short_chunk_chars,
+                long_punctuation_min_chars=args.long_punctuation_min_chars,
+                max_punctuation_ratio=args.max_punctuation_ratio,
+                min_merge_tokens=args.min_merge_tokens,
+                small_title_max_tokens=args.small_title_max_tokens,
+            )
+            elapsed = time.perf_counter() - file_start
+            if result.indexed:
+                indexed_count += 1
+                total_chunks_indexed += result.num_chunks
+                logging.info(
+                    "[%s/%s] Indexed %s | chunks=%s | time=%.2fs",
+                    file_number,
+                    len(all_txt),
+                    txt_path.name,
+                    result.num_chunks,
+                    elapsed,
+                )
+            else:
+                skipped_count += 1
+                logging.info(
+                    "[%s/%s] Skipped %s | reason=%s | time=%.2fs",
+                    file_number,
+                    len(all_txt),
+                    txt_path.name,
+                    result.status,
+                    elapsed,
+                )
+        except Exception as exc:
+            failed_count += 1
+            logging.exception(
+                "[%s/%s] Failed %s | error=%s",
+                file_number,
+                len(all_txt),
+                txt_path.name,
+                str(exc),
+            )
+
+    elapsed = time.perf_counter() - run_start
+    logging.info(
+        "Text indexing complete | total_files=%s | indexed=%s | skipped=%s | failed=%s | total_chunks_indexed=%s | elapsed_seconds=%.2f",
+        len(all_txt),
+        indexed_count,
+        skipped_count,
+        failed_count,
+        total_chunks_indexed,
+        elapsed,
+    )
+
+
+if __name__ == "__main__":
+    main()

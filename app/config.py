@@ -56,9 +56,13 @@ class Settings:
 
         return Settings(
             embedding_provider=os.getenv("EMBEDDING_PROVIDER", "openai"),
-            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            openai_api_key=(
+                os.getenv("OPENAI_API_KEY")
+                or os.getenv("DEEPINFRA_TOKEN")
+                or os.getenv("DEEPINFRA_API_KEY")
+            ),
             openai_embedding_model=os.getenv(
-                "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"
+                "OPENAI_EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-8B"
             ),
             azure_openai_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
             azure_openai_api_key=os.getenv("AZURE_OPENAI_API_KEY"),
@@ -75,11 +79,11 @@ class Settings:
                 os.getenv("LOCAL_EMBEDDING_NORMALIZE"), True
             ),
             local_embedding_prompt_style=os.getenv(
-                "LOCAL_EMBEDDING_PROMPT_STYLE", "e5"
+                "LOCAL_EMBEDDING_PROMPT_STYLE", "none"
             ),
             local_embedding_device=os.getenv("LOCAL_EMBEDDING_DEVICE"),
             llm_provider=os.getenv("LLM_PROVIDER", "deepinfra"),
-            deepinfra_api_key=os.getenv("DEEPINFRA_API_KEY"),
+            deepinfra_api_key=os.getenv("DEEPINFRA_API_KEY") or os.getenv("DEEPINFRA_TOKEN"),
             deepinfra_base_url=os.getenv(
                 "DEEPINFRA_BASE_URL", "https://api.deepinfra.com/v1/openai"
             ),

@@ -6,6 +6,7 @@ import hashlib
 import logging
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,7 +17,7 @@ from app.db.sqlite_store import ChunkRecord, DocumentRecord, SQLiteDocumentStore
 from app.db.vector_store import VectorStore, build_vector_store
 from app.embeddings.client import build_embedding_client
 from app.ingestion.chunker import TokenChunker
-from app.ingestion.pdf_reader import extract_text_from_pdf
+from app.ingestion.pdf_reader_llm import build_pdf_text_extractor
 
 
 @dataclass(frozen=True)
@@ -144,6 +145,23 @@ def _extract_tender_id_from_path(path: Path) -> str | None:
     return None
 
 
+def _resolve_tender_id_for_pdf(
+    path: Path,
+    *,
+    input_root: Path,
+    metadata_by_path: dict[str, TenderMetadata],
+) -> str:
+    try:
+        relative_path = path.relative_to(input_root)
+        metadata = metadata_by_path.get(_normalize_path_value(relative_path.as_posix()))
+        if metadata and metadata.tender_id:
+            return metadata.tender_id
+    except ValueError:
+        pass
+
+    return _extract_tender_id_from_path(path) or "unknown"
+
+
 def iter_pdf_paths(input_dir: Path) -> Iterator[Path]:
     if not input_dir.exists():
         raise FileNotFoundError(f"Input folder not found: {input_dir}")
@@ -178,6 +196,7 @@ def index_pdf(
     reindex: bool,
     embed_batch_size: int,
     recreate_table_on_dim_mismatch: bool,
+    text_extractor: Callable[[Path], str],
 ) -> IndexResult:
     step_timings: dict[str, float] = {}
 
@@ -201,7 +220,7 @@ def index_pdf(
         return IndexResult(indexed=False, num_chunks=0, status="already_indexed")
 
     step_start = time.perf_counter()
-    text = extract_text_from_pdf(path)
+    text = text_extractor(path)
     step_timings["extract_text_from_pdf"] = time.perf_counter() - step_start
     if not text:
         logging.info(
@@ -347,7 +366,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--table",
-        default="tender_chunks",
+        default="mini_data",
         help="Vector collection/table name.",
     )
     parser.add_argument(
@@ -380,6 +399,16 @@ def main() -> None:
         default="tenders_data.csv",
         help="CSV file containing tender metadata to attach to each indexed chunk.",
     )
+    parser.add_argument(
+        "--pdf-reader-mode",
+        default="baseline",
+        choices=["baseline", "llm", "llm_vision"],
+        help=(
+            "PDF reader mode: 'baseline' uses deterministic extraction, "
+            "'llm' runs text reconstruction with the configured LLM, "
+            "'llm_vision' renders PDF pages as images and uses multimodal LLM input."
+        ),
+    )
     args = parser.parse_args()
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
@@ -389,6 +418,10 @@ def main() -> None:
     settings = Settings.from_env()
     input_dir = Path(args.input)
     metadata_csv_path = Path(args.metadata_csv)
+    text_extractor = build_pdf_text_extractor(
+        settings,
+        reader_mode=args.pdf_reader_mode,
+    )
     store = SQLiteDocumentStore(settings.sqlite_db_path)
     vector_store = build_vector_store(settings, table_name=args.table)
     embed_client = build_embedding_client(
@@ -403,6 +436,7 @@ def main() -> None:
         local_normalize=settings.local_embedding_normalize,
         local_prompt_style=settings.local_embedding_prompt_style,
         local_device=settings.local_embedding_device,
+        deepinfra_base_url=settings.deepinfra_base_url,
     )
     chunker = TokenChunker(
         chunk_size=settings.chunk_size_tokens,
@@ -448,6 +482,7 @@ def main() -> None:
                 recreate_table_on_dim_mismatch=(
                     args.reindex and not args.no_table_recreate_on_dim_mismatch
                 ),
+                text_extractor=text_extractor,
             )
             file_elapsed = time.perf_counter() - file_start
             total_file_processing_seconds += file_elapsed
@@ -465,11 +500,17 @@ def main() -> None:
                 )
             else:
                 skipped_count += 1
+                tender_id = _resolve_tender_id_for_pdf(
+                    pdf_path,
+                    input_root=input_dir,
+                    metadata_by_path=metadata_by_path,
+                )
                 logging.info(
-                    "[%s/%s] Skipped %s | reason=%s | time=%.2fs",
+                    "[%s/%s] Skipped %s | tender_id=%s | reason=%s | time=%.2fs",
                     file_number,
                     len(all_pdfs),
                     pdf_path.name,
+                    tender_id,
                     result.status,
                     file_elapsed,
                 )

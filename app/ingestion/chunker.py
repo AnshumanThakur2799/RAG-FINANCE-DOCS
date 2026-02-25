@@ -9,7 +9,7 @@ import tiktoken
 @dataclass(frozen=True)
 class TokenChunker:
     chunk_size: int = 500
-    overlap: int = 50
+    overlap: int = 100
     separators: tuple[str, ...] = ("\n\n", "\n", ". ", " ", "")
     length_kind: str = "token"
     encoding_name: str = "cl100k_base"

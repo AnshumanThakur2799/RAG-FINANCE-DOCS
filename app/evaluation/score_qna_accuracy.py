@@ -263,6 +263,7 @@ def main() -> None:
         local_normalize=settings.local_embedding_normalize,
         local_prompt_style=settings.local_embedding_prompt_style,
         local_device=settings.local_embedding_device,
+        deepinfra_base_url=settings.deepinfra_base_url,
     )
     document_store = SQLiteDocumentStore(settings.sqlite_db_path)
     vector_store = build_vector_store(settings, table_name=args.table)

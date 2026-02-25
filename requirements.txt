@@ -5,4 +5,13 @@ tiktoken
 python-dotenv
 sentence-transformers
 markitdown[pdf]
+pdfplumber
+PyMuPDF
+pdf2image
+pytesseract
+paddleocr
+paddlepaddle
+numpy
 langchain-text-splitters
+fastapi
+uvicorn

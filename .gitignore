@@ -184,8 +184,12 @@ app/db/
 *create*
 *copy*
 tender_downloads/
-mini_tenders_data/
+*mini_tenders_data*
 tender_downloads_chunked/
 tenders_data.csv
 
+data/metadata.db
+dense_results.json
+fused_results.json
+lexical_results.json
 data/metadata.db
