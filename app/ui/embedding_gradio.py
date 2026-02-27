@@ -9,13 +9,13 @@ from app.config import Settings
 from app.db.sqlite_store import SQLiteDocumentStore
 from app.db.vector_store import build_vector_store
 from app.embeddings.client import build_embedding_client
+from app.llm.call_logger import log_llm_call
 from app.llm.client import build_llm_client
 from app.retrieval import (
     RETRIEVAL_MODES,
     build_full_tender_context,
     build_retriever,
 )
-
 
 SYSTEM_PROMPT = """
 You are an internal Enterprise AI Assistant for business teams.
@@ -30,14 +30,14 @@ Behavior rules:
 2. Keep responses concise and decision-ready.
 3. Use plain text or markdown; use bullets only when they improve clarity.
 4. Highlight dates, amounts, percentages, owners, and deadlines when present.
-5. Cite factual statements using: [source#chunk_or_page].
+5. Cite factual statements using concrete IDs from context, e.g. [Tendernotice_1.txt#42] or [2026_DOF_992746_1].
 6. If multiple documents are relevant, cite up to the 3 strongest sources.
 7. If the question is ambiguous, ask one short clarification question.
 8. Do not output chain-of-thought or internal reasoning.
+9. If the question has multiple answer, provide them in a structured format with their sources.
 
 Length control:
-- Keep the response concise (target under ~900 tokens).
-- If content is long, prioritize the direct answer first.
+- provide all the necessary information requested.
 """
 
 TENDER_ID_PATTERN = re.compile(r"\d{4}_[A-Za-z0-9]+_\d+_\d+")
@@ -66,7 +66,7 @@ def _format_citation_source(result: dict) -> str:
 
 
 def _has_citation(text: str) -> bool:
-    return bool(re.search(r"\[[^\]]+#\d+\]", text))
+    return bool(re.search(r"\[[^\]]+#[^\]]+\]", text))
 
 
 def _strip_think_blocks(text: str) -> str:
@@ -81,7 +81,8 @@ def _build_ask_user_prompt(query: str, context: str) -> str:
         "Do not include extra sections or templates.\n"
         "Use bullets only if needed for clarity.\n\n"
         "Rules:\n"
-        "- Include citation(s) for factual claims using [source#chunk_or_page].\n"
+        "- Include citation(s) for factual claims using exact context citation IDs.\n"
+        "- Valid formats: [source_name#chunk_id] or [tender_id].\n"
         "- If info is missing, say 'Insufficient information in the provided documents.'\n"
         "- No chain-of-thought, no XML tags."
     )
@@ -153,6 +154,17 @@ class EmbeddingGradioApp:
                 document_store=self.document_store,
                 hybrid_rrf_k=self.settings.hybrid_rrf_k,
                 hybrid_candidate_multiplier=self.settings.hybrid_candidate_multiplier,
+                deepinfra_api_key=self.settings.deepinfra_api_key,
+                reranker_enabled=self.settings.reranker_enabled,
+                reranker_model=self.settings.reranker_model,
+                reranker_instruction=self.settings.reranker_instruction,
+                reranker_service_tier=self.settings.reranker_service_tier,
+                reranker_base_url=self.settings.reranker_base_url,
+                reranker_top_k_multiplier=self.settings.reranker_top_k_multiplier,
+                llm_client=self.llm_client,
+                multi_query_enabled=self.settings.multi_query_enabled,
+                multi_query_count=self.settings.multi_query_count,
+                multi_query_language=self.settings.multi_query_language,
             )
             start_time = time.perf_counter()
             results = retriever.retrieve(query, top_k=top_k_int)
@@ -168,10 +180,13 @@ class EmbeddingGradioApp:
             source = _format_citation_source(result)
             chunk_id = result.get("chunk_id", "n/a")
             score = result.get(
-                "_rrf_score",
+                "_reranker_score",
                 result.get(
-                    "_distance",
-                    result.get("_lexical_score", result.get("score", "n/a")),
+                    "_rrf_score",
+                    result.get(
+                        "_distance",
+                        result.get("_lexical_score", result.get("score", "n/a")),
+                    ),
                 ),
             )
             if isinstance(score, float):
@@ -210,6 +225,17 @@ class EmbeddingGradioApp:
                 document_store=self.document_store,
                 hybrid_rrf_k=self.settings.hybrid_rrf_k,
                 hybrid_candidate_multiplier=self.settings.hybrid_candidate_multiplier,
+                deepinfra_api_key=self.settings.deepinfra_api_key,
+                reranker_enabled=self.settings.reranker_enabled,
+                reranker_model=self.settings.reranker_model,
+                reranker_instruction=self.settings.reranker_instruction,
+                reranker_service_tier=self.settings.reranker_service_tier,
+                reranker_base_url=self.settings.reranker_base_url,
+                reranker_top_k_multiplier=self.settings.reranker_top_k_multiplier,
+                llm_client=self.llm_client,
+                multi_query_enabled=self.settings.multi_query_enabled,
+                multi_query_count=self.settings.multi_query_count,
+                multi_query_language=self.settings.multi_query_language,
             )
             results = retriever.retrieve(query, top_k=top_k_int)
         except Exception as exc:
@@ -221,14 +247,38 @@ class EmbeddingGradioApp:
         context, selected_tender_ids = build_full_tender_context(
             results=results,
             document_store=self.document_store,
-            max_unique_tenders=3,
+            max_unique_tenders=top_k_int,
         )
 
         user_prompt = _build_ask_user_prompt(query, context)
 
         try:
+            with open("user_prompt.txt", "w") as f:
+                f.write(user_prompt)
+            log_llm_call(
+                source="ui.embedding_gradio",
+                operation="chat.ask",
+                status="started",
+                query=query,
+                details={"mode": mode, "top_k": top_k_int},
+            )
             answer = self.llm_client.chat(SYSTEM_PROMPT, user_prompt)
+            log_llm_call(
+                source="ui.embedding_gradio",
+                operation="chat.ask",
+                status="succeeded",
+                query=query,
+                details={"mode": mode, "top_k": top_k_int},
+            )
         except Exception as exc:
+            log_llm_call(
+                source="ui.embedding_gradio",
+                operation="chat.ask",
+                status="failed",
+                query=query,
+                details={"mode": mode, "top_k": top_k_int},
+                error=str(exc),
+            )
             return f"LLM call failed: {exc}"
 
         answer = _strip_think_blocks(answer).strip()
@@ -236,7 +286,7 @@ class EmbeddingGradioApp:
         if not _has_citation(answer):
             fallback_sources = []
             if selected_tender_ids:
-                fallback_sources = [f"[{tender_id}/full_text#full]" for tender_id in selected_tender_ids]
+                fallback_sources = [f"[{tender_id}]" for tender_id in selected_tender_ids]
             else:
                 for result in results[:3]:
                     source = _format_citation_source(result)
@@ -267,6 +317,17 @@ class EmbeddingGradioApp:
                 document_store=self.document_store,
                 hybrid_rrf_k=self.settings.hybrid_rrf_k,
                 hybrid_candidate_multiplier=self.settings.hybrid_candidate_multiplier,
+                deepinfra_api_key=self.settings.deepinfra_api_key,
+                reranker_enabled=self.settings.reranker_enabled,
+                reranker_model=self.settings.reranker_model,
+                reranker_instruction=self.settings.reranker_instruction,
+                reranker_service_tier=self.settings.reranker_service_tier,
+                reranker_base_url=self.settings.reranker_base_url,
+                reranker_top_k_multiplier=self.settings.reranker_top_k_multiplier,
+                llm_client=self.llm_client,
+                multi_query_enabled=self.settings.multi_query_enabled,
+                multi_query_count=self.settings.multi_query_count,
+                multi_query_language=self.settings.multi_query_language,
             )
             results = retriever.retrieve(query, top_k=top_k_int)
         except Exception as exc:
@@ -280,30 +341,80 @@ class EmbeddingGradioApp:
         context, selected_tender_ids = build_full_tender_context(
             results=results,
             document_store=self.document_store,
-            max_unique_tenders=3,
+            max_unique_tenders=top_k_int,
         )
 
         user_prompt = _build_ask_user_prompt(query, context)
         yield "Generating..."
         partial_answer = ""
         try:
+            log_llm_call(
+                source="ui.embedding_gradio",
+                operation="stream_chat.ask",
+                status="started",
+                query=query,
+                details={"mode": mode, "top_k": top_k_int},
+            )
+            token_count = 0
             for token in self.llm_client.stream_chat(SYSTEM_PROMPT, user_prompt):
+                token_count += 1
                 partial_answer = _strip_think_blocks(f"{partial_answer}{token}").strip()
                 yield partial_answer
             answer = partial_answer
-        except Exception:
+            log_llm_call(
+                source="ui.embedding_gradio",
+                operation="stream_chat.ask",
+                status="succeeded",
+                query=query,
+                details={
+                    "mode": mode,
+                    "top_k": top_k_int,
+                    "token_count": token_count,
+                },
+            )
+        except Exception as stream_exc:
+            log_llm_call(
+                source="ui.embedding_gradio",
+                operation="stream_chat.ask",
+                status="failed",
+                query=query,
+                details={"mode": mode, "top_k": top_k_int},
+                error=str(stream_exc),
+            )
             try:
+                log_llm_call(
+                    source="ui.embedding_gradio",
+                    operation="chat.ask_fallback",
+                    status="started",
+                    query=query,
+                    details={"mode": mode, "top_k": top_k_int},
+                )
                 answer = _strip_think_blocks(
                     self.llm_client.chat(SYSTEM_PROMPT, user_prompt)
                 ).strip()
+                log_llm_call(
+                    source="ui.embedding_gradio",
+                    operation="chat.ask_fallback",
+                    status="succeeded",
+                    query=query,
+                    details={"mode": mode, "top_k": top_k_int},
+                )
             except Exception as exc:
+                log_llm_call(
+                    source="ui.embedding_gradio",
+                    operation="chat.ask_fallback",
+                    status="failed",
+                    query=query,
+                    details={"mode": mode, "top_k": top_k_int},
+                    error=str(exc),
+                )
                 yield f"LLM call failed: {exc}"
                 return
 
         if not _has_citation(answer):
             fallback_sources = []
             if selected_tender_ids:
-                fallback_sources = [f"[{tender_id}/full_text#full]" for tender_id in selected_tender_ids]
+                fallback_sources = [f"[{tender_id}]" for tender_id in selected_tender_ids]
             else:
                 for result in results[:3]:
                     source = _format_citation_source(result)

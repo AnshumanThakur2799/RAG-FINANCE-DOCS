@@ -6,7 +6,8 @@ import re
 from pathlib import Path
 
 
-LONG_CHAR_RUNS_PATTERN = re.compile(r"([*_.])\1{2,}")
+LONG_CHAR_RUNS_PATTERN = re.compile(r"([=*_.\-–—])\1{2,}")
+VERY_LONG_FILLER_RUNS_PATTERN = re.compile(r"[=*_.\-–—]{40,}")
 
 
 def iter_text_paths(root_dir: Path) -> list[Path]:
@@ -18,13 +19,20 @@ def iter_text_paths(root_dir: Path) -> list[Path]:
 def normalize_long_char_runs(text: str) -> tuple[str, int]:
     replacement_count = 0
 
+    def _remove_filler(match: re.Match[str]) -> str:
+        nonlocal replacement_count
+        replacement_count += 1
+        return ""
+
+    text_without_fillers = VERY_LONG_FILLER_RUNS_PATTERN.sub(_remove_filler, text)
+
     def _replace(match: re.Match[str]) -> str:
         nonlocal replacement_count
         replacement_count += 1
         repeated_char = match.group(1)
         return repeated_char * 2
 
-    normalized_text = LONG_CHAR_RUNS_PATTERN.sub(_replace, text)
+    normalized_text = LONG_CHAR_RUNS_PATTERN.sub(_replace, text_without_fillers)
     return normalized_text, replacement_count
 
 
@@ -60,8 +68,8 @@ def normalize_text_files(root_dir: Path, dry_run: bool = False) -> tuple[int, in
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Recursively normalize long runs of '*', '_' and '.' in .txt files "
-            "to exactly 2 characters."
+            "Recursively normalize long runs of '=', '*', '_', '.', '-' and dashes in "
+            ".txt files (remove very long filler runs, otherwise reduce to 2 chars)."
         )
     )
     parser.add_argument(

@@ -330,7 +330,7 @@ class SQLiteDocumentStore:
         if not tokens:
             return ""
         unique_tokens = list(dict.fromkeys(tokens))
-        return " OR ".join(f'"{token}"' for token in unique_tokens[:20])
+        return " OR ".join(f'"{token}"' for token in unique_tokens)
 
     def search_chunks(self, query: str, *, top_k: int = 5) -> list[dict]:
         fts_query = self._to_fts_query(query)

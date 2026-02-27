@@ -18,7 +18,7 @@ SYSTEM_PROMPT = """You are an internal Enterprise AI Assistant for business team
 
 Mandatory rules:
 - Answer only what the user asked.
-- Cite factual claims using [source#page_or_chunk], with up to the 5 most relevant citations.
+- Cite factual claims using concrete context IDs such as [source_name#chunk_id] or [tender_id/full_text#full], with up to the 5 most relevant citations.
 - If context is insufficient, explicitly say "Insufficient information in the provided documents."
 - Keep responses concise, factual, and operational.
 - Do not force templates, JSON, or extra sections unless the user asks for them.
@@ -55,7 +55,7 @@ def _format_citation_source(result: dict) -> str:
 
 
 def _has_citation(text: str) -> bool:
-    return bool(re.search(r"\[[^\]]+#\d+\]", text))
+    return bool(re.search(r"\[[^\]]+#[^\]]+\]", text))
 
 
 class EmbeddingApp:
@@ -188,6 +188,17 @@ class EmbeddingApp:
                 document_store=self.document_store,
                 hybrid_rrf_k=self.settings.hybrid_rrf_k,
                 hybrid_candidate_multiplier=self.settings.hybrid_candidate_multiplier,
+                deepinfra_api_key=self.settings.deepinfra_api_key,
+                reranker_enabled=self.settings.reranker_enabled,
+                reranker_model=self.settings.reranker_model,
+                reranker_instruction=self.settings.reranker_instruction,
+                reranker_service_tier=self.settings.reranker_service_tier,
+                reranker_base_url=self.settings.reranker_base_url,
+                reranker_top_k_multiplier=self.settings.reranker_top_k_multiplier,
+                llm_client=self.llm_client,
+                multi_query_enabled=self.settings.multi_query_enabled,
+                multi_query_count=self.settings.multi_query_count,
+                multi_query_language=self.settings.multi_query_language,
             )
             start_time = time.time()
             results = retriever.retrieve(query, top_k=top_k)
@@ -206,10 +217,13 @@ class EmbeddingApp:
             source = _format_citation_source(result)
             chunk_id = result.get("chunk_id", "n/a")
             score = result.get(
-                "_rrf_score",
+                "_reranker_score",
                 result.get(
-                    "_distance",
-                    result.get("_lexical_score", result.get("score", "n/a")),
+                    "_rrf_score",
+                    result.get(
+                        "_distance",
+                        result.get("_lexical_score", result.get("score", "n/a")),
+                    ),
                 ),
             )
             if isinstance(score, float):
@@ -249,6 +263,17 @@ class EmbeddingApp:
                 document_store=self.document_store,
                 hybrid_rrf_k=self.settings.hybrid_rrf_k,
                 hybrid_candidate_multiplier=self.settings.hybrid_candidate_multiplier,
+                deepinfra_api_key=self.settings.deepinfra_api_key,
+                reranker_enabled=self.settings.reranker_enabled,
+                reranker_model=self.settings.reranker_model,
+                reranker_instruction=self.settings.reranker_instruction,
+                reranker_service_tier=self.settings.reranker_service_tier,
+                reranker_base_url=self.settings.reranker_base_url,
+                reranker_top_k_multiplier=self.settings.reranker_top_k_multiplier,
+                llm_client=self.llm_client,
+                multi_query_enabled=self.settings.multi_query_enabled,
+                multi_query_count=self.settings.multi_query_count,
+                multi_query_language=self.settings.multi_query_language,
             )
             search_start = time.perf_counter()
             results = retriever.retrieve(query, top_k=top_k)

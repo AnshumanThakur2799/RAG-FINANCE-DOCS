@@ -192,4 +192,9 @@ data/metadata.db
 dense_results.json
 fused_results.json
 lexical_results.json
-data/metadata.db
+data\metadata.db
+llm_calls.log
+generated_queries.json
+reranker_candidates.json
+reranked_results.json
+

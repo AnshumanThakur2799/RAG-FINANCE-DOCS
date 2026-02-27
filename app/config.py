@@ -47,6 +47,15 @@ class Settings:
     retrieval_mode: str
     hybrid_rrf_k: int
     hybrid_candidate_multiplier: int
+    multi_query_enabled: bool
+    multi_query_count: int
+    multi_query_language: str
+    reranker_enabled: bool
+    reranker_model: str
+    reranker_instruction: str
+    reranker_top_k_multiplier: int
+    reranker_service_tier: str
+    reranker_base_url: str
 
     @staticmethod
     def from_env() -> "Settings":
@@ -108,4 +117,29 @@ class Settings:
             hybrid_candidate_multiplier=int(
                 os.getenv("HYBRID_CANDIDATE_MULTIPLIER", "4")
             ),
+            multi_query_enabled=_parse_bool(
+                os.getenv("MULTI_QUERY_ENABLED"), True
+            ),
+            multi_query_count=max(1, int(os.getenv("MULTI_QUERY_COUNT", "3"))),
+            multi_query_language=os.getenv("MULTI_QUERY_LANGUAGE", "English"),
+            reranker_enabled=_parse_bool(os.getenv("RERANKER_ENABLED"), True),
+            reranker_model=os.getenv(
+                "RERANKER_MODEL", "Qwen/Qwen3-Reranker-4B"
+            ).strip()
+            or "Qwen/Qwen3-Reranker-4B",
+            reranker_instruction=os.getenv(
+                "RERANKER_INSTRUCTION",
+                "Given a web search query, retrieve relevant passages that answer the query",
+            ),
+            reranker_top_k_multiplier=max(
+                1, int(os.getenv("RERANKER_TOP_K_MULTIPLIER", "4"))
+            ),
+            reranker_service_tier=os.getenv(
+                "RERANKER_SERVICE_TIER", "default"
+            ).strip()
+            or "default",
+            reranker_base_url=os.getenv(
+                "DEEPINFRA_RERANKER_BASE_URL",
+                "https://api.deepinfra.com/v1/inference",
+            ).rstrip("/"),
         )

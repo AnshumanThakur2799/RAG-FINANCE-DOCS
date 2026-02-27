@@ -73,7 +73,7 @@ That means:
 - Do not merge unrelated sections.
 - Do not hallucinate missing content.
 - If text is unreadable, write: [Unreadable text due to OCR].
-- Do NOT output long runs of repeated punctuation/symbols (for example:
+- Do NOT output long runs of repeated punctuation/symbols and line separators (for example:
   "_____", "-----", "=====", "......", repeated box-drawing characters).
 - If a line is only a visual form rule/blank (signature line, underline, separator),
   OMIT that line instead of reproducing it.
@@ -164,7 +164,7 @@ def extract_text_from_pdf_with_llm_vision(
     path: Path,
     *,
     llm_client: LLMClient,
-    max_pages_per_call: int = 2,
+    max_pages_per_call: int = 1,
     min_non_whitespace_chars_for_vision: int = MIN_NON_WHITESPACE_CHARS_FOR_VISION,
 ) -> str:
     baseline_text = extract_text_from_pdf(path)
@@ -278,6 +278,7 @@ def build_pdf_text_extractor(
         deepinfra_model=settings.deepinfra_model,
         max_tokens=settings.llm_max_tokens,
         temperature=settings.llm_temperature,
+        frequency_penalty=0.4,
     )
 
     def _extractor(path: Path) -> str:

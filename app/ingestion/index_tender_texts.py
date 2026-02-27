@@ -6,12 +6,9 @@ import json
 import logging
 import re
 import time
-from functools import lru_cache
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
-
-import tiktoken
 
 from app.config import Settings
 from app.db.sqlite_store import (
@@ -104,8 +101,9 @@ _PAGE_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 _DOT_LEADER_RE = re.compile(r"^[\.\-`'\"~_=\s]+$")
-_WORD_RE = re.compile(r"\b[\w]+\b", re.UNICODE)
-_SMALL_TITLE_RE = re.compile(r"^[A-Z0-9:,\- ]+$")
+_TABLE_CONTEXT_MAX_CHARS = 1200
+_SMALL_TABLE_THRESHOLD_CHARS = 700
+_TABLE_TARGET_RETRIEVAL_CHARS = 1200
 
 
 def _is_noise_line(line: str) -> bool:
@@ -124,61 +122,18 @@ def _clean_inter_table_text(text: str) -> str:
     return "\n".join(kept_lines).strip()
 
 
-def _is_low_value_chunk(
-    chunk: str,
+def _trim_table_context(
+    text: str,
     *,
-    min_short_chunk_chars: int,
-    long_punctuation_min_chars: int,
-    max_punctuation_ratio: float,
-) -> bool:
-    stripped = chunk.strip()
-    if not stripped:
-        return True
-
-    compact = "".join(stripped.split())
-    if not compact:
-        return True
-
-    if _PAGE_MARKER_RE.match(stripped):
-        return True
-    if _DOT_LEADER_RE.match(stripped) and len(compact) >= 12:
-        return True
-
-    word_count = len(_WORD_RE.findall(stripped))
-    alnum_count = sum(char.isalnum() for char in compact)
-    punct_count = len(compact) - alnum_count
-
-    # Character-size based guardrail: tiny 1-2 word chunks are usually low value.
-    if word_count <= 6 and len(compact) < min_short_chunk_chars:
-        return True
-
-    # Remove long punctuation-heavy OCR artifacts.
-    if len(compact) >= long_punctuation_min_chars:
-        punctuation_ratio = punct_count / max(1, len(compact))
-        if punctuation_ratio >= max_punctuation_ratio and alnum_count < 8:
-            return True
-
-    return False
-
-
-@lru_cache(maxsize=4)
-def _get_encoding(encoding_name: str):
-    return tiktoken.get_encoding(encoding_name)
-
-
-def _token_count(text: str, *, encoding_name: str) -> int:
-    return len(_get_encoding(encoding_name).encode(text))
-
-
-def _is_table_chunk_text(chunk: str) -> bool:
-    stripped = chunk.strip()
-    if not stripped.startswith("{") or not stripped.endswith("}"):
-        return False
-    try:
-        obj = json.loads(stripped)
-    except json.JSONDecodeError:
-        return False
-    return _is_table_object(obj)
+    keep_from_end: bool,
+    max_chars: int = _TABLE_CONTEXT_MAX_CHARS,
+) -> str:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if len(normalized) <= max_chars:
+        return normalized
+    if keep_from_end:
+        return normalized[-max_chars:]
+    return normalized[:max_chars]
 
 
 def _table_value_to_text(value: object) -> str:
@@ -235,144 +190,47 @@ def _table_json_to_single_passage(raw_table_json: str) -> str:
     return f"{prefix} {' '.join(row_sections)}"
 
 
-def _prepare_chunks_for_retrieval(chunks: list[str]) -> list[ChunkForIndexing]:
-    prepared: list[ChunkForIndexing] = []
-    for chunk in chunks:
-        stripped = chunk.strip()
-        parsed_table = _parse_table_json_preserving_number_text(stripped)
-        if not parsed_table:
-            prepared.append(ChunkForIndexing(retrieval_text=chunk))
-            continue
-        prepared.append(
-            ChunkForIndexing(
-                retrieval_text=_table_json_to_single_passage(stripped),
-                raw_table_json=stripped,
-            )
-        )
-    return prepared
-
-
-def _render_chunk_with_small_titles(text: str, small_titles: list[str]) -> str:
-    if not small_titles:
-        return text.strip()
-    title_prefix = "\n".join(f"[TITLE] {title}" for title in small_titles)
-    return f"{title_prefix}\n\n{text.strip()}".strip()
-
-
-def _merge_small_chunks_in_group(
-    group_chunks: list[str],
+def _table_retrieval_text_with_context(
+    raw_table_json: str,
     *,
-    min_tokens: int,
-    small_title_max_tokens: int,
-    encoding_name: str,
-) -> list[str]:
-    merged: list[dict[str, list[str] | str]] = []
-    pending_titles: list[str] = []
-    pending_prefix: list[str] = []
+    context_above: str,
+    context_below: str,
+) -> str:
+    table_content = _table_json_to_single_passage(raw_table_json)
+    parts: list[str] = [f"Table content: {table_content}"]
 
-    for chunk in group_chunks:
-        stripped = chunk.strip()
-        if not stripped:
-            continue
+    # Add surrounding context only for very small tables to avoid losing intent.
+    if len(table_content) >= _SMALL_TABLE_THRESHOLD_CHARS:
+        return "\n\n".join(parts)
 
-        token_count = _token_count(stripped, encoding_name=encoding_name)
-        if (
-            token_count <= small_title_max_tokens
-            and _SMALL_TITLE_RE.match(stripped)
-            and any(ch.isalpha() for ch in stripped)
-        ):
-            if merged:
-                cast_titles = merged[-1]["small_titles"]
-                assert isinstance(cast_titles, list)
-                cast_titles.append(stripped)
-            else:
-                pending_titles.append(stripped)
-            continue
+    needed_chars = max(0, _TABLE_TARGET_RETRIEVAL_CHARS - len(table_content))
+    if needed_chars == 0:
+        return "\n\n".join(parts)
 
-        if token_count < min_tokens:
-            if merged:
-                cast_text = merged[-1]["text"]
-                assert isinstance(cast_text, str)
-                merged[-1]["text"] = f"{cast_text.rstrip()}\n{stripped}"
-            else:
-                pending_prefix.append(stripped)
-            continue
-
-        composed_text = stripped
-        if pending_prefix:
-            composed_text = "\n".join(pending_prefix + [composed_text])
-            pending_prefix = []
-
-        chunk_titles = pending_titles
-        pending_titles = []
-        merged.append({"text": composed_text, "small_titles": chunk_titles})
-
-    if pending_titles:
-        if merged:
-            cast_titles = merged[-1]["small_titles"]
-            assert isinstance(cast_titles, list)
-            cast_titles.extend(pending_titles)
-        else:
-            pending_prefix.extend(pending_titles)
-    if pending_prefix:
-        if merged:
-            cast_text = merged[-1]["text"]
-            assert isinstance(cast_text, str)
-            merged[-1]["text"] = f"{cast_text.rstrip()}\n" + "\n".join(pending_prefix)
-        else:
-            merged.append({"text": "\n".join(pending_prefix), "small_titles": []})
-
-    output: list[str] = []
-    for item in merged:
-        cast_text = item["text"]
-        cast_titles = item["small_titles"]
-        assert isinstance(cast_text, str)
-        assert isinstance(cast_titles, list)
-        output.append(_render_chunk_with_small_titles(cast_text, cast_titles))
-    return output
-
-
-def merge_small_chunks(
-    chunks: list[str],
-    *,
-    min_tokens: int,
-    small_title_max_tokens: int,
-    encoding_name: str,
-) -> list[str]:
-    if not chunks:
-        return []
-
-    merged_output: list[str] = []
-    current_group: list[str] = []
-    current_is_table: bool | None = None
-
-    for chunk in chunks:
-        is_table = _is_table_chunk_text(chunk)
-        if current_is_table is None:
-            current_is_table = is_table
-        if is_table != current_is_table:
-            merged_output.extend(
-                _merge_small_chunks_in_group(
-                    current_group,
-                    min_tokens=min_tokens,
-                    small_title_max_tokens=small_title_max_tokens,
-                    encoding_name=encoding_name,
-                )
-            )
-            current_group = []
-            current_is_table = is_table
-        current_group.append(chunk)
-
-    if current_group:
-        merged_output.extend(
-            _merge_small_chunks_in_group(
-                current_group,
-                min_tokens=min_tokens,
-                small_title_max_tokens=small_title_max_tokens,
-                encoding_name=encoding_name,
-            )
+    per_side_target = min(_TABLE_CONTEXT_MAX_CHARS, max(120, needed_chars // 2))
+    above = (
+        _trim_table_context(
+            context_above,
+            keep_from_end=True,
+            max_chars=per_side_target,
         )
-    return merged_output
+        if context_above
+        else ""
+    )
+    below = (
+        _trim_table_context(
+            context_below,
+            keep_from_end=False,
+            max_chars=per_side_target,
+        )
+        if context_below
+        else ""
+    )
+    if above:
+        parts.insert(0, f"Context above table: {above}")
+    if below:
+        parts.append(f"Context below table: {below}")
+    return "\n\n".join(parts)
 
 
 def chunk_text_preserving_tables(
@@ -382,7 +240,7 @@ def chunk_text_preserving_tables(
     table_parse_max_chars: int,
     tender_id: str,
     source_name: str,
-) -> list[str]:
+) -> list[ChunkForIndexing]:
     if len(text) > table_parse_max_chars:
         logging.warning(
             "Skipping table-preserving parse | tender_id=%s | file=%s | chars=%s > %s. "
@@ -392,28 +250,50 @@ def chunk_text_preserving_tables(
             len(text),
             table_parse_max_chars,
         )
-        return chunker.chunk(text)
+        return [ChunkForIndexing(retrieval_text=chunk) for chunk in chunker.chunk(text)]
 
     table_ranges = _extract_table_ranges(text)
     if not table_ranges:
-        return chunker.chunk(text)
+        return [ChunkForIndexing(retrieval_text=chunk) for chunk in chunker.chunk(text)]
 
-    chunks: list[str] = []
+    chunks: list[ChunkForIndexing] = []
     cursor = 0
-    for start, end in table_ranges:
+    for idx, (start, end) in enumerate(table_ranges):
+        context_above = ""
         if start > cursor:
-            normal_text = _clean_inter_table_text(text[cursor:start])
-            if normal_text:
-                chunks.extend(chunker.chunk(normal_text))
+            context_above = _clean_inter_table_text(text[cursor:start])
+            if context_above:
+                chunks.extend(
+                    ChunkForIndexing(retrieval_text=chunk)
+                    for chunk in chunker.chunk(context_above)
+                )
+
+        next_start = (
+            table_ranges[idx + 1][0] if idx + 1 < len(table_ranges) else len(text)
+        )
+        context_below = _clean_inter_table_text(text[end:next_start])
+
         table_text = text[start:end].strip()
         if table_text:
-            chunks.append(table_text)
+            chunks.append(
+                ChunkForIndexing(
+                    retrieval_text=_table_retrieval_text_with_context(
+                        table_text,
+                        context_above=context_above,
+                        context_below=context_below,
+                    ),
+                    raw_table_json=table_text,
+                )
+            )
         cursor = end
 
     if cursor < len(text):
         tail_text = _clean_inter_table_text(text[cursor:])
         if tail_text:
-            chunks.extend(chunker.chunk(tail_text))
+            chunks.extend(
+                ChunkForIndexing(retrieval_text=chunk)
+                for chunk in chunker.chunk(tail_text)
+            )
     return chunks
 
 
@@ -481,11 +361,6 @@ def index_text_file(
     fast_chunk_threshold_chars: int,
     fast_chunk_size_chars: int,
     fast_chunk_overlap_chars: int,
-    min_short_chunk_chars: int,
-    long_punctuation_min_chars: int,
-    max_punctuation_ratio: float,
-    min_merge_tokens: int,
-    small_title_max_tokens: int,
 ) -> IndexResult:
     file_hash = compute_file_hash(path)
     existing = store.get_by_hash(file_hash)
@@ -519,68 +394,30 @@ def index_text_file(
             len(text),
             fast_chunk_threshold_chars,
         )
-        chunks = chunk_text_fast_by_chars(
-            text,
-            chunk_size_chars=fast_chunk_size_chars,
-            overlap_chars=fast_chunk_overlap_chars,
-        )
+        chunk_payloads = [
+            ChunkForIndexing(retrieval_text=chunk)
+            for chunk in chunk_text_fast_by_chars(
+                text,
+                chunk_size_chars=fast_chunk_size_chars,
+                overlap_chars=fast_chunk_overlap_chars,
+            )
+        ]
     else:
-        chunks = chunk_text_preserving_tables(
+        chunk_payloads = chunk_text_preserving_tables(
             text,
             chunker=chunker,
             table_parse_max_chars=table_parse_max_chars,
             tender_id=tender_id,
             source_name=path.name,
         )
-    before_filter_count = len(chunks)
-    chunks = [
-        chunk
-        for chunk in chunks
-        if _is_table_chunk_text(chunk)
-        or not _is_low_value_chunk(
-            chunk,
-            min_short_chunk_chars=min_short_chunk_chars,
-            long_punctuation_min_chars=long_punctuation_min_chars,
-            max_punctuation_ratio=max_punctuation_ratio,
-        )
-    ]
-    dropped_count = before_filter_count - len(chunks)
-    if dropped_count:
-        logging.info(
-            "Dropped low-value chunks | file=%s | dropped=%s | kept=%s",
-            path.name,
-            dropped_count,
-            len(chunks),
-        )
-    before_merge_count = len(chunks)
-    chunks = merge_small_chunks(
-        chunks,
-        min_tokens=min_merge_tokens,
-        small_title_max_tokens=small_title_max_tokens,
-        encoding_name=chunker.encoding_name,
-    )
-    merged_delta = before_merge_count - len(chunks)
-    if merged_delta:
-        logging.info(
-            "Merged small chunks | file=%s | reduced_by=%s | final=%s",
-            path.name,
-            merged_delta,
-            len(chunks),
-        )
-    if not chunks:
-        logging.warning(
-            "All chunks filtered out as low-value | file=%s | tender_id=%s",
-            path.name,
-            tender_id,
-        )
-        return IndexResult(indexed=False, num_chunks=0, status="all_chunks_filtered")
+    if not chunk_payloads:
+        return IndexResult(indexed=False, num_chunks=0, status="no_chunks")
     logging.info(
         "Chunked %s | chunks=%s | chunk_time=%.2fs",
         path.name,
-        len(chunks),
+        len(chunk_payloads),
         time.perf_counter() - chunk_start,
     )
-    chunk_payloads = _prepare_chunks_for_retrieval(chunks)
     chunk_texts_for_embedding = [item.retrieval_text for item in chunk_payloads]
 
     embeddings: list[list[float]] = []
@@ -661,7 +498,7 @@ def index_text_file(
             file_size=stat.st_size,
             modified_time=stat.st_mtime,
             indexed_at=store.now_iso(),
-            num_chunks=len(chunks),
+            num_chunks=len(chunk_payloads),
         )
     )
     if tender_id != "unknown":
@@ -676,7 +513,7 @@ def index_text_file(
                 indexed_at=store.now_iso(),
             )
         )
-    return IndexResult(indexed=True, num_chunks=len(chunks), status="indexed")
+    return IndexResult(indexed=True, num_chunks=len(chunk_payloads), status="indexed")
 
 
 def main() -> None:
@@ -762,46 +599,6 @@ def main() -> None:
         default=300,
         help="Character overlap for fast chunking path.",
     )
-    parser.add_argument(
-        "--min-short-chunk-chars",
-        type=int,
-        default=50,
-        help=(
-            "Drop chunks with <=6 words if total non-space chars are below this value."
-        ),
-    )
-    parser.add_argument(
-        "--long-punctuation-min-chars",
-        type=int,
-        default=20,
-        help=(
-            "Apply punctuation-noise filtering only to chunks at or above this size."
-        ),
-    )
-    parser.add_argument(
-        "--max-punctuation-ratio",
-        type=float,
-        default=0.60,
-        help="Drop chunks when punctuation ratio meets/exceeds this threshold.",
-    )
-    parser.add_argument(
-        "--min-merge-tokens",
-        type=int,
-        default=40,
-        help=(
-            "Merge chunks smaller than this token count into adjacent chunks "
-            "within the same chunk-type boundary."
-        ),
-    )
-    parser.add_argument(
-        "--small-title-max-tokens",
-        type=int,
-        default=6,
-        help=(
-            "If a chunk is all-caps-ish and at most this many tokens, attach it "
-            "to a neighboring chunk instead of embedding it alone."
-        ),
-    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -877,11 +674,6 @@ def main() -> None:
                 fast_chunk_threshold_chars=args.fast_chunk_threshold_chars,
                 fast_chunk_size_chars=args.fast_chunk_size_chars,
                 fast_chunk_overlap_chars=args.fast_chunk_overlap_chars,
-                min_short_chunk_chars=args.min_short_chunk_chars,
-                long_punctuation_min_chars=args.long_punctuation_min_chars,
-                max_punctuation_ratio=args.max_punctuation_ratio,
-                min_merge_tokens=args.min_merge_tokens,
-                small_title_max_tokens=args.small_title_max_tokens,
             )
             elapsed = time.perf_counter() - file_start
             if result.indexed:

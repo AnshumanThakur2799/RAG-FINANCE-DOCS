@@ -7,6 +7,7 @@ from app.config import Settings
 from app.db.sqlite_store import SQLiteDocumentStore
 from app.db.vector_store import build_vector_store
 from app.embeddings.client import build_embedding_client
+from app.llm.client import build_llm_client
 from app.retrieval import RETRIEVAL_MODES, build_retriever
 
 
@@ -114,6 +115,19 @@ def main() -> None:
     )
     document_store = SQLiteDocumentStore(settings.sqlite_db_path)
     vector_store = build_vector_store(settings, table_name=args.table)
+    llm_client = None
+    if settings.multi_query_enabled:
+        try:
+            llm_client = build_llm_client(
+                settings.llm_provider,
+                deepinfra_api_key=settings.deepinfra_api_key,
+                deepinfra_base_url=settings.deepinfra_base_url,
+                deepinfra_model=settings.deepinfra_model,
+                max_tokens=settings.llm_max_tokens,
+                temperature=settings.llm_temperature,
+            )
+        except Exception:
+            llm_client = None
     retrieval_mode = args.retrieval_mode.strip().lower() or settings.retrieval_mode
     retriever = build_retriever(
         mode=retrieval_mode,
@@ -122,6 +136,17 @@ def main() -> None:
         document_store=document_store,
         hybrid_rrf_k=settings.hybrid_rrf_k,
         hybrid_candidate_multiplier=settings.hybrid_candidate_multiplier,
+        deepinfra_api_key=settings.deepinfra_api_key,
+        reranker_enabled=settings.reranker_enabled,
+        reranker_model=settings.reranker_model,
+        reranker_instruction=settings.reranker_instruction,
+        reranker_service_tier=settings.reranker_service_tier,
+        reranker_base_url=settings.reranker_base_url,
+        reranker_top_k_multiplier=settings.reranker_top_k_multiplier,
+        llm_client=llm_client,
+        multi_query_enabled=settings.multi_query_enabled,
+        multi_query_count=settings.multi_query_count,
+        multi_query_language=settings.multi_query_language,
     )
 
     filters = _build_filters(args)
@@ -140,8 +165,13 @@ def main() -> None:
         source = result.get("source_name") or result.get("source_path", "unknown")
         chunk_id = result.get("chunk_id", "n/a")
         score = result.get(
-            "_rrf_score",
-            result.get("_distance", result.get("_lexical_score", result.get("score", "n/a"))),
+            "_reranker_score",
+            result.get(
+                "_rrf_score",
+                result.get(
+                    "_distance", result.get("_lexical_score", result.get("score", "n/a"))
+                ),
+            ),
         )
         if isinstance(score, float):
             score_display = f"{score:.4f}"

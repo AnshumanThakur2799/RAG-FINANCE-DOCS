@@ -275,6 +275,13 @@ def main() -> None:
         document_store=document_store,
         hybrid_rrf_k=settings.hybrid_rrf_k,
         hybrid_candidate_multiplier=settings.hybrid_candidate_multiplier,
+        deepinfra_api_key=settings.deepinfra_api_key,
+        reranker_enabled=settings.reranker_enabled,
+        reranker_model=settings.reranker_model,
+        reranker_instruction=settings.reranker_instruction,
+        reranker_service_tier=settings.reranker_service_tier,
+        reranker_base_url=settings.reranker_base_url,
+        reranker_top_k_multiplier=settings.reranker_top_k_multiplier,
     )
 
     with input_path.open("r", encoding="utf-8-sig", newline="") as infile:
