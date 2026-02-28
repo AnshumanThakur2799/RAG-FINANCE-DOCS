@@ -16,6 +16,7 @@ from app.retrieval import (
     build_full_tender_context,
     build_retriever,
 )
+import json
 
 SYSTEM_PROMPT = """
 You are an internal Enterprise AI Assistant for business teams.
@@ -345,6 +346,8 @@ class EmbeddingGradioApp:
         )
 
         user_prompt = _build_ask_user_prompt(query, context)
+        with open("user_prompt.json", "w") as f:
+            json.dump({"query": query, "user_prompt": user_prompt}, f)
         yield "Generating..."
         partial_answer = ""
         try:

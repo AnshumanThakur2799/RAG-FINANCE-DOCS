@@ -117,13 +117,16 @@ def _apply_rerank(
 
     documents = [str(item.get("text", "")).strip() for item in candidates]
     scores = reranker.rerank(query=query, documents=documents)
+    # include all the score greater than 0.95
     scored_items: list[dict[str, Any]] = []
     for item, score in zip(candidates, scores):
         enriched = dict(item)
         enriched["_reranker_score"] = float(score)
-        scored_items.append(enriched)
+        if score > 0.95:
+            scored_items.append(enriched)
+
     scored_items.sort(key=lambda item: float(item.get("_reranker_score", 0.0)), reverse=True)
-    return scored_items[: max(1, top_k)]
+    return scored_items
 
 
 MULTI_QUERY_PROMPT_TEMPLATE = """
@@ -233,6 +236,13 @@ def build_full_tender_context(
     document_store: SQLiteDocumentStore,
     max_unique_tenders: int = 3,
 ) -> tuple[str, list[str]]:
+    def _wrap_context_block(identifier: str, body: str) -> str:
+        return (
+            f"===== BEGIN DOCUMENT: {identifier} =====\n"
+            f"{body}\n"
+            f"===== END DOCUMENT: {identifier} ====="
+        )
+
     selected_tender_ids = collect_top_unique_tender_ids(
         results, max_unique_tenders=max_unique_tenders
     )
@@ -246,10 +256,17 @@ def build_full_tender_context(
                 metadata_line = _format_result_metadata(result)
                 if metadata_line:
                     context_lines.append(
-                        f"[{source}#{chunk_id}] META: {metadata_line}\n{text}"
+                        _wrap_context_block(
+                            f"{source}#{chunk_id}",
+                            f"[{source}#{chunk_id}] META: {metadata_line}\n{text}",
+                        )
                     )
                 else:
-                    context_lines.append(f"[{source}#{chunk_id}] {text}")
+                    context_lines.append(
+                        _wrap_context_block(
+                            f"{source}#{chunk_id}", f"[{source}#{chunk_id}] {text}"
+                        )
+                    )
         return "\n\n".join(context_lines), []
 
     context_lines: list[str] = []
@@ -264,10 +281,17 @@ def build_full_tender_context(
         if full_text:
             if metadata_line:
                 context_lines.append(
-                    f"[{tender_id}/full_text#full] META: {metadata_line}\n{full_text}"
+                    _wrap_context_block(
+                        tender_id,
+                        f"[{tender_id}/full_text#full] META: {metadata_line}\n{full_text}",
+                    )
                 )
             else:
-                context_lines.append(f"[{tender_id}/full_text#full]\n{full_text}")
+                context_lines.append(
+                    _wrap_context_block(
+                        tender_id, f"[{tender_id}/full_text#full]\n{full_text}"
+                    )
+                )
             continue
 
         # Fallback for older indexed data where tender-level full text is unavailable.
@@ -289,7 +313,9 @@ def build_full_tender_context(
             else:
                 chunk_lines.append(f"[{source}#{chunk_id}] {text}")
         if chunk_lines:
-            context_lines.append("\n\n".join(chunk_lines))
+            context_lines.append(
+                _wrap_context_block(tender_id, "\n\n".join(chunk_lines))
+            )
 
     return "\n\n".join(context_lines), selected_tender_ids
 
@@ -755,7 +781,7 @@ class MultiQueryRetriever:
                     executor.submit(
                         self.base_retriever.retrieve,
                         variant,
-                        top_k=top_k,
+                        top_k=top_k * max(1,self.reranker_top_k_multiplier),
                         filters=filters,
                     )
                     for variant in queries
