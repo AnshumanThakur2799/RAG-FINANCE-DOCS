@@ -6,7 +6,7 @@ Enterprise Retrieval-Augmented Generation (RAG) pipeline for tender and finance 
 
 - Multi-source ingestion: PDF indexing plus pre-extracted text indexing.
 - Metadata-aware retrieval with `dense`, `lexical`, and `hybrid` modes.
-- Optional multi-query expansion and DeepInfra reranking.
+- Hybrid retrieval with Reciprocal Rank Fusion (RRF).
 - Full-tender context assembly for higher-answer completeness.
 - UI + CLI interfaces for search and grounded Q&A.
 - Retrieval benchmark script with `recall@k`, `precision@k`, `MRR@k`, and `NDCG@k`.
@@ -17,9 +17,10 @@ Enterprise Retrieval-Augmented Generation (RAG) pipeline for tender and finance 
 2. Chunk content (token chunking, plus table-aware chunking for text ingestion).
 3. Generate embeddings and upsert vectors to LanceDB or Qdrant.
 4. Index lexical chunks and tender-level full text in SQLite.
-5. At query time, retrieve with dense/lexical/hybrid (and optional multi-query + reranker).
-6. Build final LLM context (including full text for top tender IDs when available).
-7. Generate grounded answer with citation formatting and fallback citation injection.
+5. At query time, run retrieval in `dense`, `lexical`, or `hybrid` mode.
+6. In `hybrid`, retrieve dense + lexical candidates, then fuse rankings with RRF.
+7. Build final LLM context from top tender IDs (prefer tender full text, fallback to chunks).
+8. Generate grounded answer, strip `<think>` blocks, and inject fallback citations when needed.
 
 ## System Design Diagrams
 
@@ -48,16 +49,12 @@ flowchart LR
     R --> R1[Dense Retriever]
     R --> R2[Lexical Retriever]
     R --> R3[Hybrid RRF]
-    R --> R4[Multi-Query Expansion optional]
-    R --> R5[DeepInfra Reranker optional]
 
     E --> R1
     F1 --> R2
     R1 --> G[Ranked Candidates]
     R2 --> G
     R3 --> G
-    R4 --> G
-    R5 --> G
 
     G --> H[Full Tender Context Builder]
     F2 --> H
@@ -71,27 +68,32 @@ flowchart LR
 sequenceDiagram
     participant U as User/UI/CLI
     participant RB as Retriever Builder
-    participant MQ as Multi-Query (optional)
     participant DR as Dense Retriever
     participant LR as Lexical Retriever
-    participant RR as Reranker (optional)
+    participant RRF as Rank Fusion (hybrid)
     participant CTX as Context Builder
     participant LLM as LLM Client
 
     U->>RB: query, top_k, mode, filters
-    RB->>MQ: generate variants (if enabled)
-    MQ-->>RB: q1..qn
-    RB->>DR: vector search per query
-    RB->>LR: FTS search per query
-    DR-->>RB: dense ranked lists
-    LR-->>RB: lexical ranked lists
-    RB->>RR: rerank merged candidates (if enabled)
-    RR-->>RB: reranked top_k
-    RB-->>RB: fallback to RRF if reranker fails
+    alt mode=dense
+        RB->>DR: embed query and vector search
+        DR-->>RB: dense top_k
+    else mode=lexical
+        RB->>LR: SQLite FTS search
+        LR-->>RB: lexical top_k
+    else mode=hybrid
+        RB->>DR: dense candidate search (top_k * multiplier)
+        RB->>LR: lexical candidate search (top_k * multiplier)
+        DR-->>RRF: dense candidates
+        LR-->>RRF: lexical candidates
+        RRF-->>RB: fused top_k (RRF score)
+    end
     RB->>CTX: top results
-    CTX-->>RB: full tender context (when available)
+    CTX-->>RB: tender full text for top tender IDs (fallback to chunks)
     RB->>LLM: system prompt + question + context
-    LLM-->>U: grounded answer + citations
+    LLM-->>RB: raw answer
+    RB-->>RB: strip <think>, ensure citations
+    RB-->>U: grounded answer + citations
 ```
 
 ### 3) Ingestion Flow (PDF and Text)
@@ -120,13 +122,13 @@ flowchart TD
 
 ## Improvements in This Version
 
-- Added optional **multi-query retrieval** with LLM-generated query variants.
-- Added optional **DeepInfra reranker** and automatic fallback to RRF on reranker failure.
+- Added **hybrid retrieval with RRF** over dense + lexical candidates.
 - Added **full-tender context assembly** to pass richer evidence into answer generation.
+- Added **citation hardening** with fallback citation injection when model output has no citations.
 - Added **table-aware text ingestion** with `raw_table_json` persistence for structured table context.
 - Added **LLM-based PDF reader modes** (`llm`, `llm_vision`) with baseline fallback.
 - Added **metadata-aware filters** in search CLI for organization, tender ID, and date ranges.
-- Added **debug artifact outputs** (`generated_queries.json`, `dense_results.json`, `lexical_results.json`, `reranker_candidates.json`, `reranked_results.json`, `fused_results.json`) to inspect ranking behavior.
+- Added **debug artifact outputs** (`dense_results.json`, `lexical_results.json`, `fused_results.json`) to inspect ranking behavior.
 
 ## Repository Structure
 
@@ -188,9 +190,9 @@ Core variables:
 
 Advanced retrieval flags (supported by `Settings`):
 
-- `MULTI_QUERY_ENABLED`, `MULTI_QUERY_COUNT`, `MULTI_QUERY_LANGUAGE`
-- `RERANKER_ENABLED`, `RERANKER_MODEL`, `RERANKER_INSTRUCTION`
-- `RERANKER_TOP_K_MULTIPLIER`, `RERANKER_SERVICE_TIER`, `DEEPINFRA_RERANKER_BASE_URL`
+- `RETRIEVAL_MODE`
+- `HYBRID_RRF_K`
+- `HYBRID_CANDIDATE_MULTIPLIER`
 
 ## Usage
 
@@ -263,7 +265,7 @@ python -m app.evaluation.score_qna_accuracy \
 ## Current Limitations
 
 - No dedicated production API server layer yet (primarily CLI/UI driven).
-- Quality is sensitive to extraction/chunking quality and embedding/reranker model choice.
+- Quality is sensitive to extraction/chunking quality and embedding/LLM model choice.
 - Citation attachment is robust but still heuristic in ambiguous multi-source cases.
 
 ## Quick Start Checklist
