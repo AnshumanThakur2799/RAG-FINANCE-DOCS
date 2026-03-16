@@ -18,6 +18,8 @@ def log_llm_call(
     query: str | None = None,
     details: dict[str, Any] | None = None,
     error: str | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
 ) -> None:
     payload: dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -31,6 +33,12 @@ def log_llm_call(
         payload["details"] = details
     if error:
         payload["error"] = error
+    if input_tokens is not None:
+        payload["input_tokens"] = input_tokens
+    if output_tokens is not None:
+        payload["output_tokens"] = output_tokens
+    if input_tokens is not None and output_tokens is not None:
+        payload["total_tokens"] = input_tokens + output_tokens
 
     line = json.dumps(payload, ensure_ascii=True)
     try:

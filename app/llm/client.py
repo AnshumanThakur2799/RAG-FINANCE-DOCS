@@ -40,8 +40,6 @@ class DeepInfraChatClient:
     model: str
     max_tokens: int | None = None
     temperature: float = 0.2
-    frequency_penalty: float | None = None
-    reasoning_effort: str | None = "low"
 
     def __post_init__(self) -> None:
         self._client = OpenAI(api_key=self.api_key, base_url=self.base_url)
@@ -53,79 +51,29 @@ class DeepInfraChatClient:
         return cleaned.strip()
 
     def chat(self, system_prompt: str, user_prompt: str) -> str:
-        request_kwargs = {
-            "model": self.model,
-            "messages": [
+        response = self._client.chat.completions.create(
+            model=self.model,
+            messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "max_tokens": self.max_tokens or None,
-            "temperature": self.temperature,
-        }
-        if self.frequency_penalty is not None:
-            request_kwargs["frequency_penalty"] = self.frequency_penalty
-        if self.reasoning_effort:
-            request_kwargs["reasoning_effort"] = self.reasoning_effort
-        try:
-            response = self._client.chat.completions.create(**request_kwargs)
-        except Exception as exc:
-            message = str(exc).lower()
-            if (
-                self.reasoning_effort
-                and "reasoning_effort" in message
-                and any(
-                    token in message
-                    for token in (
-                        "unsupported",
-                        "unknown",
-                        "extra",
-                        "invalid",
-                        "not permitted",
-                    )
-                )
-            ):
-                request_kwargs.pop("reasoning_effort", None)
-                response = self._client.chat.completions.create(**request_kwargs)
-            else:
-                raise
+            max_tokens=self.max_tokens or None,
+            temperature=self.temperature,
+        )
         content = response.choices[0].message.content or ""
         return self._sanitize_response(content)
 
     def stream_chat(self, system_prompt: str, user_prompt: str):
-        request_kwargs = {
-            "model": self.model,
-            "messages": [
+        stream = self._client.chat.completions.create(
+            model=self.model,
+            messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "max_tokens": self.max_tokens or None,
-            "temperature": self.temperature,
-            "stream": True,
-        }
-        if self.reasoning_effort:
-            request_kwargs["reasoning_effort"] = self.reasoning_effort
-        try:
-            stream = self._client.chat.completions.create(**request_kwargs)
-        except Exception as exc:
-            message = str(exc).lower()
-            if (
-                self.reasoning_effort
-                and "reasoning_effort" in message
-                and any(
-                    token in message
-                    for token in (
-                        "unsupported",
-                        "unknown",
-                        "extra",
-                        "invalid",
-                        "not permitted",
-                    )
-                )
-            ):
-                request_kwargs.pop("reasoning_effort", None)
-                stream = self._client.chat.completions.create(**request_kwargs)
-            else:
-                raise
+            max_tokens=self.max_tokens or None,
+            temperature=self.temperature,
+            stream=True,
+        )
         for chunk in stream:
             if not chunk.choices:
                 continue
@@ -214,7 +162,6 @@ def build_llm_client(
     deepinfra_model: str,
     max_tokens: int | None = None,
     temperature: float,
-    frequency_penalty: float | None = None,
 ) -> LLMClient:
     provider_normalized = provider.strip().lower()
     if provider_normalized in {"deepinfra", "openai-compatible"}:
@@ -226,6 +173,5 @@ def build_llm_client(
             model=deepinfra_model,
             max_tokens=max_tokens,
             temperature=temperature,
-            frequency_penalty=frequency_penalty,
         )
     raise ValueError(f"Unsupported LLM_PROVIDER: {provider}")

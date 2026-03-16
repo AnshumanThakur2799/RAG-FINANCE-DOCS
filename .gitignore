@@ -197,4 +197,6 @@ llm_calls.log
 generated_queries.json
 reranker_candidates.json
 reranked_results.json
-
+query_intelligence_log.jsonl
+reranked_results.csv
+user_prompt.json
